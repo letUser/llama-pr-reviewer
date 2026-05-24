@@ -280,7 +280,13 @@ Per-run streaming artifacts land in `$PR_REVIEWER_HOME/.cache/` (default: `pr-re
 | `last-stream.sse` | Raw SSE response from `/v1/chat/completions` — usage block, finish_reason, every delta |
 | `last-content.txt` | Concatenated `delta.content` — the review markdown the model emitted |
 | `last-reasoning.txt` | Concatenated `delta.reasoning_content` — empty for non-reasoning models (expected) |
-| `review.lock` | `flock` queue lock for serial worker runs |
+| `req-body.json` | Final `/v1/chat/completions` request body sent to llama-server |
+| `req-sys.txt` | System prompt portion of the request (rawfile'd into `req-body.json`) |
+| `req-user.txt` | User prompt portion of the request (rawfile'd into `req-body.json`) |
+| `preflight-req.json` | Pre-send request payload used by `/tokenize` ctx-budget check |
+| `preflight-content.txt` | Pre-send user-prompt content snapshot used by the preflight check |
+| `review.lock` | `flock` worker lock — serializes `bin/review-pr` runs |
+| `queue.lock` | `flock` queue lock — serializes `bin/review-queue` drains |
 
 Watch generation live:
 
