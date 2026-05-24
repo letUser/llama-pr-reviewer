@@ -2,8 +2,9 @@
 .env
 
 # Runtime state
-.cache/
-.share/
+.share/order-grid-back
+.share/order-grid-app
+.share/order-grid-mobile-app
 
 # Backups / scratch
 *.bak
