@@ -5,7 +5,7 @@ Description=Run PR reviewer scanner every 30 minutes
 OnBootSec=5min
 OnCalendar=*:0/30
 Persistent=true
-Unit=pr-review-scan.service
+Unit=pr-scan.service
 
 [Install]
 WantedBy=timers.target

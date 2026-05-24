@@ -10,14 +10,14 @@ deterministic batch review on a single GPU box.
 ## Pipeline
 
 ```
-review-open-prs  → fills queue.tsv with eligible PRs, launches queue runner as
-                   transient systemd --user unit (pr-review-queue) ↓
-pr-review-queue  → drains queue.tsv under flock, calls per PR, sends summary ↓
-pr-review-one    → fetches diff + context, calls llama-server, posts review,
-                   erases llama-server slot 0 on exit to free VRAM
+bin/scan-open-prs  → fills queue.tsv with eligible PRs, launches queue runner as
+                     transient systemd --user unit (review-queue) ↓
+bin/review-queue   → drains queue.tsv under flock, calls per PR, sends summary ↓
+bin/review-pr      → fetches diff + context, calls llama-server, posts review,
+                     erases llama-server slot 0 on exit to free VRAM
 ```
 
-### Worker exit codes (`pr-review-one`)
+### Worker exit codes (`bin/review-pr`)
 
 | Code | Meaning |
 |------|---------|
@@ -68,13 +68,13 @@ Required env vars (see `.env.example`):
 ### One-shot review of a single PR
 
 ```bash
-./pr-review-one <repo> <pr_number>
+./bin/review-pr <repo> <pr_number>
 ```
 
 ### Scan + queue + drain (manual)
 
 ```bash
-./review-open-prs        # finds eligible open PRs, fills queue, starts queue
+./bin/scan-open-prs      # finds eligible open PRs, fills queue, starts queue
 ```
 
 ### Scheduled scan via systemd --user
@@ -82,10 +82,10 @@ Required env vars (see `.env.example`):
 Sample units in `systemd/`. Link them in-place (edits to the unit files in this repo take effect after `daemon-reload`):
 
 ```bash
-systemctl --user link "$PWD/systemd/pr-review-scan.service"
-systemctl --user link "$PWD/systemd/pr-review-scan.timer"
+systemctl --user link "$PWD/systemd/pr-scan.service"
+systemctl --user link "$PWD/systemd/pr-scan.timer"
 systemctl --user daemon-reload
-systemctl --user enable --now pr-review-scan.timer
+systemctl --user enable --now pr-scan.timer
 ```
 
 Note: paths must be absolute (hence `$PWD/...`). Moving or renaming this directory breaks the symlinks — re-run the `link` commands.
@@ -110,8 +110,8 @@ Default cadence: every 30 minutes (edit timer to taste).
 | `MAX_TOKENS` | `8192` | LLM response token budget |
 | `PR_REVIEWER_HOME` | script dir | Override location of `.env`, `.cache`, `.share` |
 | `WORKSPACE_BASE` | `$PR_REVIEWER_HOME/.share` | Override clone location |
-| `WORKER` | sibling `pr-review-one` | Path to worker used by queue runner |
-| `QUEUE_RUNNER` | sibling `pr-review-queue` | Path to queue runner used by scanner |
+| `WORKER` | sibling `review-pr` | Path to worker used by queue runner |
+| `QUEUE_RUNNER` | sibling `review-queue` | Path to queue runner used by scanner |
 
 Full list in `.env.example`.
 
@@ -129,8 +129,8 @@ Full list in `.env.example`.
 
 When `NOTIFY_TARGET` + `NOTIFY_CHANNEL` are set, two messages per run are sent via `openclaw`:
 
-1. **Queue start** (from `review-open-prs`): list of queued `repo#pr` items.
-2. **Queue done** (from `pr-review-queue`): per-PR outcome line with emoji — ✅ approved, ⚠️ approved with caution, ❌ needs changes, ❓ needs clarification, 💬 commented, ⏭ skipped (already reviewed / author skipped), 🔥 worker failure — plus the PR URL.
+1. **Queue start** (from `bin/scan-open-prs`): list of queued `repo#pr` items.
+2. **Queue done** (from `bin/review-queue`): per-PR outcome line with emoji — ✅ approved, ⚠️ approved with caution, ❌ needs changes, ❓ needs clarification, 💬 commented, ⏭ skipped (already reviewed / author skipped), 🔥 worker failure — plus the PR URL.
 
 ## License
 
