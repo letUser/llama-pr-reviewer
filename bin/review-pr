@@ -59,7 +59,12 @@ MAX_CALLERS_PER_SYMBOL="${MAX_CALLERS_PER_SYMBOL:-3}"
 MAX_COMMENT_BODY="${MAX_COMMENT_BODY:-200}"
 
 # thinking mode eats tokens before answer. Give big budget.
-MAX_TOKENS="${MAX_TOKENS:-8192}"
+MAX_TOKENS="${MAX_TOKENS:-16384}"
+
+# llama-server context size. prompt + MAX_TOKENS must fit.
+CTX_SIZE="${CTX_SIZE:-65536}"
+# Safety margin (tokens) kept free below ctx limit.
+CTX_SAFETY_MARGIN="${CTX_SAFETY_MARGIN:-512}"
 
 # Cap title length used in markdown header (avoid huge h1 lines).
 MAX_TITLE_LEN="${MAX_TITLE_LEN:-60}"
@@ -568,6 +573,29 @@ $TEMPLATE"
 # --- Call llama-server ---
 echo "Calling llama-server (model=$LLAMA_MODEL, prompt bytes=${#USER_PROMPT})..."
 
+# --- Pre-flight: count prompt tokens, enforce ctx budget ---
+TOK_JSON="$(jq -n --arg c "$SYSTEM_PROMPT"$'\n'"$USER_PROMPT" '{content: $c}')"
+TOK_RESP="$(curl -s -X POST "$LLAMA_URL/tokenize" \
+  -H 'content-type: application/json' \
+  -d "$TOK_JSON")"
+PROMPT_TOKENS="$(jq -r '.tokens | length' <<<"$TOK_RESP" 2>/dev/null || echo "")"
+
+if [[ -z "$PROMPT_TOKENS" || "$PROMPT_TOKENS" == "null" ]]; then
+  # Fallback estimate: 1 token ≈ 4 chars.
+  PROMPT_TOKENS=$(( (${#SYSTEM_PROMPT} + ${#USER_PROMPT}) / 4 ))
+  echo "warn: /tokenize unavailable, estimated prompt_tokens≈$PROMPT_TOKENS" >&2
+fi
+
+BUDGET_LIMIT=$(( CTX_SIZE - CTX_SAFETY_MARGIN ))
+NEEDED=$(( PROMPT_TOKENS + MAX_TOKENS ))
+echo "tokens: prompt=$PROMPT_TOKENS max_output=$MAX_TOKENS ctx=$CTX_SIZE (margin=$CTX_SAFETY_MARGIN)"
+
+if (( NEEDED > BUDGET_LIMIT )); then
+  echo "ERROR: prompt($PROMPT_TOKENS) + MAX_TOKENS($MAX_TOKENS) = $NEEDED exceeds ctx budget $BUDGET_LIMIT." >&2
+  echo "Options: shrink diff (HUNK_CONTEXT_LINES, MAX_SYMBOLS), lower MAX_TOKENS, or raise CTX_SIZE/server -c." >&2
+  exit 5
+fi
+
 REQ_JSON="$(jq -n \
   --arg model "$LLAMA_MODEL" \
   --arg sys "$SYSTEM_PROMPT" \
@@ -589,6 +617,9 @@ REQ_JSON="$(jq -n \
 RESP="$(curl -s -X POST "$LLAMA_URL/v1/chat/completions" \
   -H 'content-type: application/json' \
   -d "$REQ_JSON")"
+
+USAGE="$(jq -r '.usage // {} | "prompt=\(.prompt_tokens // "?") completion=\(.completion_tokens // "?") total=\(.total_tokens // "?")"' <<<"$RESP" 2>/dev/null || true)"
+[[ -n "$USAGE" ]] && echo "usage: $USAGE"
 
 REVIEW_MD="$(jq -r '.choices[0].message.content // ""' <<<"$RESP")"
 REASONING="$(jq -r '.choices[0].message.reasoning_content // ""' <<<"$RESP" 2>/dev/null || true)"

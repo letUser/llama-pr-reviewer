@@ -25,6 +25,7 @@ bin/review-pr      → fetches diff + context, calls llama-server, posts review,
 | `100` | Skipped — already reviewed at current HEAD |
 | `101` | Skipped — PR author in `SKIP_AUTHORS` |
 | `4` | Model output missing `Conclusion:` line |
+| `5` | Prompt + `MAX_TOKENS` exceed `CTX_SIZE - CTX_SAFETY_MARGIN` |
 | other | Worker failure |
 
 The queue runner uses these to classify each PR in the completion summary.
@@ -35,7 +36,7 @@ The queue runner uses these to classify each PR in the completion summary.
 - [`gh`](https://cli.github.com/) (authenticated: `gh auth login`)
 - `jq`
 - `curl`, `awk`, `sed`, `git`, `flock`
-- A running [llama-server](https://github.com/ggml-org/llama.cpp) (OpenAI-compatible endpoint) with **~45K token context minimum** (120KB diff + prompt + ~8K response)
+- A running [llama-server](https://github.com/ggml-org/llama.cpp) (OpenAI-compatible endpoint) with **~64K token context** (`CTX_SIZE` default). Reasoning models need headroom — prompt ≤ ~30K + `MAX_TOKENS` output budget (default 16K, raise for chatty reasoning models).
 - `systemd --user` (only for the timer + `RESTART_LLAMA=1` auto-restart features)
 - `openclaw` (optional, for queue start/done notifications via `NOTIFY_TARGET` — supports any channel openclaw exposes: telegram, whatsapp, etc.)
 
@@ -105,7 +106,9 @@ Default cadence: every 30 minutes (edit timer to taste).
 | `NOTIFY_TARGET` | — | Notification target ID for queue start/done events (requires `openclaw`). Empty = no notify |
 | `NOTIFY_CHANNEL` | `telegram` | openclaw channel (`telegram`, `whatsapp`, etc — any channel openclaw supports) |
 | `MAX_DIFF_BYTES` | `120000` | Diff truncation budget |
-| `MAX_TOKENS` | `8192` | LLM response token budget |
+| `MAX_TOKENS` | `16384` | Output token cap (`n_predict`). Reasoning models burn tokens before answer — raise on `finish_reason=length` |
+| `CTX_SIZE` | `65536` | llama-server context window. Worker aborts (exit 5) if prompt + `MAX_TOKENS` won't fit |
+| `CTX_SAFETY_MARGIN` | `512` | Tokens kept free below `CTX_SIZE` |
 | `PR_REVIEWER_HOME` | script dir | Override location of `.env`, `.cache`, `.share` |
 | `WORKSPACE_BASE` | `$PR_REVIEWER_HOME/.share` | Override clone location |
 | `WORKER` | sibling `review-pr` | Path to worker used by queue runner |
