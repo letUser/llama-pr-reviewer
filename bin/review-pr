@@ -121,7 +121,7 @@ PR_JSON="$(gh pr view "$PR_NUMBER" --repo "$FULL_REPO" \
   --jq '.')"
 PR_TITLE="$(jq -r '.title' <<<"$PR_JSON")"
 # Strip brackets/special tokenizer-tripping chars so the model doesn't spiral on
-# `[OGENG-9463]` vs `[OGEN-94)` etc. when re-checking the title mid-reasoning.
+# `[PROJ-9463]` vs `[PROJ-94)` etc. when re-checking the title mid-reasoning.
 PR_TITLE_SANITIZED="$(printf '%s' "$PR_TITLE" | sed -E 's/[][(){}]/ /g; s/[[:space:]]+/ /g; s/^ +| +$//g')"
 if (( ${#PR_TITLE_SANITIZED} > MAX_TITLE_LEN )); then
   PR_TITLE_HEADER="${PR_TITLE_SANITIZED:0:$MAX_TITLE_LEN}..."

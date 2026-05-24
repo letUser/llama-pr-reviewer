@@ -1,10 +1,10 @@
 # Local env with secrets/identifiers
 .env
 
-# Runtime state
-.share/order-grid-back
-.share/order-grid-app
-.share/order-grid-mobile-app
+# Runtime state — clones under .share/ (any non-example dir)
+.share/*/
+!.share/repo-example/
+!.share/repo-example-2/
 .cache/*
 
 # Backups / scratch
