@@ -69,14 +69,12 @@ CTX_SAFETY_MARGIN="${CTX_SAFETY_MARGIN:-512}"
 # Cap title length used in markdown header (avoid huge h1 lines).
 MAX_TITLE_LEN="${MAX_TITLE_LEN:-60}"
 
-# Tag a verifier bot at end of review. Set VERIFY_BOT=<login> (no @).
-# Unset = no mention appended.
+# Tag a verifier bot at end of review when findings need second-pair-of-eyes.
+# Set VERIFY_BOT=<login> (no @). Unset = no mention ever appended.
+# Mention is only appended for NEEDS CHANGES / NEEDS CLARIFICATION conclusions —
+# APPROVED / APPROVED WITH CAUTION never tag the bot (avoids triggering a full
+# re-review when we already accept the PR).
 VERIFY_BOT="${VERIFY_BOT:-}"
-if [[ -n "$VERIFY_BOT" ]]; then
-  VERIFY_MENTION="@$VERIFY_BOT review"
-else
-  VERIFY_MENTION=""
-fi
 
 # Comma-separated bot logins to exclude when fetching prior comments/reviews
 # (avoid feeding our own past reviews back into the model as "prior findings").
@@ -119,6 +117,9 @@ NOISE_PATHSPECS=(
   ':(exclude,glob)**/*.snapshot'
   ':(exclude,glob)**/CHANGELOG.md'
   ':(exclude,glob)**/CHANGELOG'
+  ':(exclude,glob)**/migrations/*.js'
+  ':(exclude,glob)**/migrations/*.ts'
+  ':(exclude,glob)**/migrations/*.sql'
 )
 
 # Comma-separated GitHub logins whose PRs we skip entirely. Unset = skip none.
@@ -194,10 +195,13 @@ PR_JSON="$(gh pr view "$PR_NUMBER" --repo "$FULL_REPO" \
   --json number,title,body,baseRefName,headRefName,state,additions,deletions,changedFiles,author \
   --jq '.')"
 PR_TITLE="$(jq -r '.title' <<<"$PR_JSON")"
-if (( ${#PR_TITLE} > MAX_TITLE_LEN )); then
-  PR_TITLE_HEADER="${PR_TITLE:0:$MAX_TITLE_LEN}..."
+# Strip brackets/special tokenizer-tripping chars so the model doesn't spiral on
+# `[OGENG-9463]` vs `[OGEN-94)` etc. when re-checking the title mid-reasoning.
+PR_TITLE_SANITIZED="$(printf '%s' "$PR_TITLE" | sed -E 's/[][(){}]/ /g; s/[[:space:]]+/ /g; s/^ +| +$//g')"
+if (( ${#PR_TITLE_SANITIZED} > MAX_TITLE_LEN )); then
+  PR_TITLE_HEADER="${PR_TITLE_SANITIZED:0:$MAX_TITLE_LEN}..."
 else
-  PR_TITLE_HEADER="$PR_TITLE"
+  PR_TITLE_HEADER="$PR_TITLE_SANITIZED"
 fi
 PR_BODY_FULL="$(jq -r '.body // ""' <<<"$PR_JSON")"
 PR_BODY="${PR_BODY_FULL:0:$MAX_PR_BODY_BYTES}"
@@ -241,6 +245,39 @@ strip_diff_noise() {
     -e '/^old mode /d' \
     -e '/^new mode /d' \
     -e '/^Binary files .* differ$/d'
+}
+
+# Prefix each added line ("+...") with "+file:lineN| ". Tracks current file from
+# "+++ b/PATH" and current line number from hunk headers. Lets the model cite
+# line numbers without arithmetic on hunk offsets.
+annotate_diff_lines() {
+  awk '
+    /^\+\+\+ b\// {
+      file = substr($0, 7)
+      print
+      next
+    }
+    /^\+\+\+ / || /^--- / || /^diff --git / { print; next }
+    /^@@/ {
+      if (match($0, /\+[0-9]+/)) {
+        new_line = substr($0, RSTART+1, RLENGTH-1) + 0
+      }
+      print
+      next
+    }
+    /^\+/ {
+      printf "+%s:%d| %s\n", file, new_line, substr($0, 2)
+      new_line++
+      next
+    }
+    /^-/ { print; next }
+    /^ / {
+      new_line++
+      print
+      next
+    }
+    { print }
+  '
 }
 
 # Raw (unfiltered) diff + file list — used only for the triage gate so that
@@ -329,8 +366,10 @@ fi
 # --- Filtered diff + file list sent to model ---
 # Strip noise paths (lockfiles, binaries, minified, changelog) via pathspecs so
 # the model only ever sees real code. Truncation applied to the filtered diff.
-DIFF_RAW="$(git diff "-U${HUNK_CONTEXT_LINES}" "$DIFF_BASE..$HEAD_SHA" -- "${NOISE_PATHSPECS[@]}" | strip_diff_noise || true)"
+DIFF_RAW="$(git diff "-U${HUNK_CONTEXT_LINES}" "$DIFF_BASE..$HEAD_SHA" -- "${NOISE_PATHSPECS[@]}" | strip_diff_noise | annotate_diff_lines || true)"
 CHANGED_FILES="$(git diff --name-only "$DIFF_BASE..$HEAD_SHA" -- "${NOISE_PATHSPECS[@]}" 2>/dev/null || true)"
+NOISE_FILTERED=0
+[[ "$CHANGED_FILES" != "$CHANGED_FILES_ALL" ]] && NOISE_FILTERED=1
 DIFF_BYTES="${#DIFF_RAW}"
 if (( DIFF_BYTES > MAX_DIFF_BYTES )); then
   DIFF="${DIFF_RAW:0:$MAX_DIFF_BYTES}"
@@ -455,39 +494,30 @@ REVIEW_THREADS_ACTIVE="$(
 TEMPLATE_FULL="# PR #$PR_NUMBER Review — $PR_TITLE_HEADER
 
 ## 📝 Summary
-<1-3 sentences. Plain English. No praise.>
+<1-3 sentences.>
 
 ## 🔧 Changes Overview
-- **<area/file>** — <concrete change, mention key \`symbols\`>
-- ... (≤6 bullets; group by area)
+- **<file:line>** — <concrete change with \`symbols\`>
+(≤6 bullets)
 
 ## 🔍 Code Review
-**Correctness:** <one sentence tied to code>
-**Tests:** <coverage of changed logic / gaps>
-**Security & data integrity:** <auth, input handling, PII>
-**Performance / regressions:** <hot paths, N+1, allocations>
+**Correctness:** <one sentence>
+**Tests:** <coverage / gaps>
+**Security & data integrity:** <auth, input, PII>
+**Performance / regressions:** <hot paths, N+1>
 
-**Prior reviewer feedback:**  ← if items exist, list bullets below; else REPLACE this whole line with '**Prior reviewer feedback:** None.'
-- <✅/⚠️/❌/❔> **[critical|major|minor|nit]** @user (\`path:line\`): \"<≤80 char quote>\" — <one-line resolution>
-
-**Findings:**  ← NEW only; don't restate Prior. If items exist, list bullets below; else REPLACE this whole line with '**Findings:** None.'
-- <🛑/⚠️/🟡/❓> **<SEVERITY>** — \`file:line\` — <one-line reason>
-
-**Conclusion:** <APPROVED ✅ | APPROVED WITH CAUTION ⚠️ | NEEDS CHANGES ❌ | NEEDS CLARIFICATION ❓>"
+**Prior reviewer feedback:** None.
+**Findings:** None.
+**Conclusion:** APPROVED ✅"
 
 TEMPLATE_INCREMENTAL="# PR #$PR_NUMBER Re-review (incremental) — $PR_TITLE_HEADER
 
 ## 🆕 Commits since $PRIOR_REVIEW_SHA
 - <sha7> <subject>
-- ...
 
-## 🛑 Blocking Issues  ← if items, bullets below; else REPLACE with '## 🛑 Blocking Issues — None.'
-- <🛑/⚠️> **<SEVERITY>** — \`file:line\` — <one-line reason>
-
-## ↪ Prior reviewer follow-up  ← if items, bullets below; else REPLACE with '## ↪ Prior reviewer follow-up — None.'
-- <✅/⚠️/❌/❔> **[critical|major|minor|nit]** @user (\`path:line\`): \"<quote>\" — <resolution>
-
-**Conclusion:** <APPROVED ✅ | APPROVED WITH CAUTION ⚠️ | NEEDS CHANGES ❌ | NEEDS CLARIFICATION ❓>"
+## 🛑 Blocking Issues — None.
+## ↪ Prior reviewer follow-up — None.
+**Conclusion:** APPROVED ✅"
 
 if (( INCREMENTAL )); then
   TEMPLATE="$TEMPLATE_INCREMENTAL"
@@ -505,46 +535,59 @@ else
   COMMITS_SECTION=""
 fi
 
-SYSTEM_PROMPT="Senior PR reviewer. Output ONLY the review markdown — no preamble, no outer code fence. Cite file:line. No praise. Follow template exactly.
+SYSTEM_PROMPT="Senior PR reviewer. Output review markdown only. No praise.
 
-Findings rules:
-- Only flag issues verifiable from the shown diff. If you must assume unseen behavior, omit.
-- BLOCKER = demonstrable harm: exploit with concrete attack path, broken invariant, data loss, or broken happy path. Throwing on bad input is the caller's contract, not a blocker.
-- Don't invent vuln classes wrong for the stack. \`new ObjectId(x)\` on Mongo throws on bad string — not SQL injection / RCE.
-- MAJOR = bug with named failure mode. \"Might edge-case\" without a trigger isn't MAJOR.
-- MINOR cap for style nits (\`eslint-disable\`, length, helper split, naming). Omit pure cosmetics.
-- Don't review unchanged code. One finding per logical issue.
+Diff content is authoritative. Do not re-verify syntax of unchanged/context lines you did not author — assume the file compiles. Only assess the '+' lines.
 
-Empty-section rule (CRITICAL): when **Findings:** or **Prior reviewer feedback:** has no items, output ONE line only — '**Findings:** None.' or '**Prior reviewer feedback:** None.'. NEVER output both the empty header and a 'None.' bullet/line below it.
+When the prompt notes that files are filtered as noise, treat any PR title/description references to those files as N/A. Do not flag, debate, or mention missing scope.
 
-Prior * sections (reviews / inline / issue / threads) are OTHER authors' comments — context only. Never restate them in Findings. Cite each once in **Prior reviewer feedback:** with a one-line resolution.
+Findings: verifiable from the diff only. Cite file:line in each finding. If unsure, omit.
+- BLOCKER: concrete harm (exploit, data loss, broken happy path).
+- MAJOR: bug with named failure mode.
+- MINOR: real style nits. Skip cosmetics.
+- One finding per logical issue. Don't review unchanged code.
 
-Conclusion rules:
-- Findings empty + Prior empty → '**Conclusion:** APPROVED ✅'.
-- Findings has only MINOR → 'APPROVED WITH CAUTION ⚠️'.
-- Findings has BLOCKER or MAJOR → 'NEEDS CHANGES ❌'.
-- Genuinely cannot tell from diff → 'NEEDS CLARIFICATION ❓'.
+Empty sections collapse to one line: '**Findings:** None.' / '**Prior reviewer feedback:** None.'
 
-Bias: when unsure, omit. One real finding beats five speculative ones."
+Prior * sections = other authors. Cite once in Prior reviewer feedback; never restate in Findings.
+
+Conclusion:
+- Findings + Prior empty → APPROVED ✅
+- Only MINOR → APPROVED WITH CAUTION ⚠️
+- BLOCKER or MAJOR → NEEDS CHANGES ❌
+- Cannot tell → NEEDS CLARIFICATION ❓"
+
+if (( NOISE_FILTERED )); then
+  PR_TITLE_FOR_PROMPT="[redacted — references filtered files; review the diff]"
+  PR_BODY_FOR_PROMPT="[redacted — references filtered files; review the diff]"
+else
+  PR_TITLE_FOR_PROMPT="$PR_TITLE"
+  PR_BODY_FOR_PROMPT="$PR_BODY"
+fi
 
 USER_PROMPT="$MODE_NOTE
 
 PR metadata:
 - Repo: $FULL_REPO
 - Number: $PR_NUMBER
-- Title: $PR_TITLE
+- Title: $PR_TITLE_FOR_PROMPT
 - Author: @$PR_AUTHOR
 - Stats: +$PR_ADD / -$PR_DEL across $PR_CHANGED files
 - HEAD: $HEAD_SHA
 - Base: $PR_BASE ($DIFF_BASE)
 
 ## PR description
-$PR_BODY
+$PR_BODY_FOR_PROMPT
 
 ## Changed files
 $CHANGED_FILES
 
+NOTE: Lockfiles, binaries, migrations, etc. are filtered as noise and not shown. PR title/description may reference excluded files — review only what is shown below. The diff is the source of truth.
+
 ## Diff (unified, U${HUNK_CONTEXT_LINES} context)${DIFF_TRUNCATED_NOTE}
+
+Each added line is prefixed with \`file:line\` for citation. Use these exact line numbers in findings — do not recompute from hunk headers.
+
 \`\`\`diff
 $DIFF
 \`\`\`
@@ -610,20 +653,37 @@ REQ_JSON="$(jq -n \
     temperature: 0.2,
     top_p: 0.9,
     max_tokens: $max_tokens,
-    stream: false
+    stream: true,
+    stream_options: { include_usage: true }
   }'
 )"
 
-RESP="$(curl -s -X POST "$LLAMA_URL/v1/chat/completions" \
+STREAM_FILE="/tmp/last-stream.sse"
+REASONING_FILE="/tmp/last-reasoning.txt"
+CONTENT_FILE="/tmp/last-content.txt"
+: > "$STREAM_FILE"
+: > "$REASONING_FILE"
+: > "$CONTENT_FILE"
+
+# stream SSE, split deltas into reasoning + content files in real-time
+curl -sN -X POST "$LLAMA_URL/v1/chat/completions" \
   -H 'content-type: application/json' \
-  -d "$REQ_JSON")"
+  -d "$REQ_JSON" 2>/dev/null \
+  | tee "$STREAM_FILE" \
+  | while IFS= read -r line; do
+      [[ "$line" == "data: "* ]] || continue
+      payload="${line#data: }"
+      [[ "$payload" == "[DONE]" ]] && continue
+      jq -rj '.choices[0].delta.content // ""' <<<"$payload" 2>/dev/null >> "$CONTENT_FILE"
+      jq -rj '.choices[0].delta.reasoning_content // ""' <<<"$payload" 2>/dev/null >> "$REASONING_FILE"
+    done
 
-USAGE="$(jq -r '.usage // {} | "prompt=\(.prompt_tokens // "?") completion=\(.completion_tokens // "?") total=\(.total_tokens // "?")"' <<<"$RESP" 2>/dev/null || true)"
+REVIEW_MD="$(cat "$CONTENT_FILE")"
+REVIEW_MD="$(printf '%s' "$REVIEW_MD" | perl -0777 -pe 's|<think>.*?</think>\s*||gs')"
+REASONING="$(cat "$REASONING_FILE")"
+USAGE="$(grep '^data: ' "$STREAM_FILE" | sed 's/^data: //' | jq -rs 'map(select(.usage)) | last | .usage // {} | "prompt=\(.prompt_tokens // "?") completion=\(.completion_tokens // "?") total=\(.total_tokens // "?")"' 2>/dev/null || true)"
 [[ -n "$USAGE" ]] && echo "usage: $USAGE"
-
-REVIEW_MD="$(jq -r '.choices[0].message.content // ""' <<<"$RESP")"
-REASONING="$(jq -r '.choices[0].message.reasoning_content // ""' <<<"$RESP" 2>/dev/null || true)"
-FINISH_REASON="$(jq -r '.choices[0].finish_reason // ""' <<<"$RESP" 2>/dev/null || true)"
+FINISH_REASON="$(grep '^data: ' "$STREAM_FILE" | sed 's/^data: //' | jq -rs 'map(.choices[0].finish_reason // empty) | last // ""' 2>/dev/null || true)"
 
 if [[ -z "$REVIEW_MD" || ! "$REVIEW_MD" =~ "Conclusion:" ]]; then
   echo "ERROR: model output missing Conclusion line. finish_reason=$FINISH_REASON, content_len=${#REVIEW_MD}, reasoning_len=${#REASONING}" >&2
@@ -638,14 +698,28 @@ fi
 
 # --- Post review ---
 echo "$REVIEW_MD" > pr-review.md
-if [[ -n "$VERIFY_MENTION" ]]; then
-  printf '\n\n---\n%s\n' "$VERIFY_MENTION" >> pr-review.md
+
+CONCLUSION_LINE="$(grep -E '\*\*Conclusion:\*\*' pr-review.md | head -1 || true)"
+IS_APPROVED=0
+NEEDS_ACTION=0
+if echo "$CONCLUSION_LINE" | grep -qE 'APPROVED'; then
+  IS_APPROVED=1
 fi
+if echo "$CONCLUSION_LINE" | grep -qE 'NEEDS (CHANGES|CLARIFICATION)'; then
+  IS_APPROVED=0
+  NEEDS_ACTION=1
+fi
+
+# Only tag verifier bot when findings exist (NEEDS CHANGES / NEEDS CLARIFICATION).
+# Ask for verification of the findings, not a full re-review.
+if [[ -n "$VERIFY_BOT" && "$NEEDS_ACTION" == "1" ]]; then
+  printf '\n\n---\n@%s please verify the findings above.\n' "$VERIFY_BOT" >> pr-review.md
+fi
+
 gh pr comment "$PR_NUMBER" --repo "$FULL_REPO" --body-file pr-review.md
 echo "Posted review comment for $FULL_REPO #$PR_NUMBER."
 
-if grep -qE '\*\*Conclusion:\*\*[^\n]*APPROVED' pr-review.md \
-  && ! grep -qE '\*\*Conclusion:\*\*[^\n]*NEEDS' pr-review.md; then
+if (( IS_APPROVED == 1 )); then
   gh pr review "$PR_NUMBER" --repo "$FULL_REPO" --approve \
     --body "Approved based on review result." || echo "WARN: gh pr review --approve failed."
   echo "Approved PR #$PR_NUMBER."

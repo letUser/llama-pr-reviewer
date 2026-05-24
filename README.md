@@ -116,13 +116,108 @@ Default cadence: every 30 minutes (edit timer to taste).
 
 Full list in `.env.example`.
 
+## Tuning for diff coverage
+
+How much code each PR review can ingest is bounded by:
+
+```
+prompt_token_budget = CTX_SIZE - CTX_SAFETY_MARGIN - MAX_TOKENS
+```
+
+The prompt holds the diff, changed-symbol context, active review threads, and the
+template. Diff bytes-to-tokens ratio is ~2.8–3.5 for code. Worker aborts (exit 5)
+if the assembled prompt won't fit.
+
+`MAX_DIFF_BYTES` is a hard truncation cap on the diff alone — set it so the
+worst-case diff still leaves room for the rest of the prompt.
+
+`HUNK_CONTEXT_LINES` is the `-U<N>` passed to `git diff`. Lower values shrink the
+diff at the cost of surrounding-code context for the model:
+
+- `U20` (ambitious) — model sees full function bodies. Best quality.
+- `U10` (default) — ~half the context overhead per hunk. Good balance.
+- `U3` — git default. Tight; model may miss why a change matters.
+
+### Failure modes
+
+| Exit | Cause | Fix |
+|------|-------|-----|
+| `4` | Reasoning model burned all `MAX_TOKENS` before writing the `Conclusion:` line | Cap thinking with llama-server `--reasoning-budget`, raise `MAX_TOKENS`, or shrink the prompt |
+| `5` | Prompt + `MAX_TOKENS` exceed `CTX_SIZE - CTX_SAFETY_MARGIN` | Lower `MAX_DIFF_BYTES`, lower `HUNK_CONTEXT_LINES`, lower `MAX_TOKENS`, or raise `CTX_SIZE` |
+
+### Reasoning model llama-server flags
+
+For chain-of-thought (CoT) models (Qwen reasoning variants, DeepSeek-R1, etc.) the
+model can spend all of `MAX_TOKENS` on internal thinking before emitting the
+answer — exit 4. Three llama-server flags address this:
+
+- `--reasoning-budget N` — hard cap on thinking tokens. After N, llama-server
+  forces end-of-thinking and the model writes its answer. `N=8000` works well
+  for small-to-medium reasoning models on PR review (deep enough for real
+  analysis, bounded enough to leave room in `MAX_TOKENS` for the review markdown).
+  Larger budgets (16000+) often spent on repetition loops, not extra signal.
+- `--reasoning-format deepseek` — routes thoughts to
+  `message.reasoning_content` and leaves `message.content` as the clean final
+  answer. The worker also strips `<think>` blocks defensively, but using
+  `deepseek` is the correct setup.
+- `--dry-multiplier 0.8 --dry-base 1.75 --dry-allowed-length 4` — DRY sampler
+  penalizes repeated n-grams. Helps small reasoning models that loop on
+  "Wait, ..." / "Let me check ..." inside the CoT. `allowed-length 4` is safe
+  for code (avoids hurting short syntactic repeats like `})`).
+
+If your llama-server build lacks `--reasoning-budget`, fall back to oversizing
+`MAX_TOKENS` (e.g. `49152`) and accept longer review wall time.
+
+### Example: 8 GB VRAM with Q8 KV cache + reasoning model
+
+llama-server flags:
+
+```
+-c 131072 \
+--cache-type-k q8_0 --cache-type-v q8_0 \
+--reasoning-format deepseek \
+--reasoning-budget 8000 \
+--dry-multiplier 0.8 \
+--dry-base 1.75 \
+--dry-allowed-length 4
+```
+
+With a 9B-class Q4 model and partial offload (`-ngl 24`) this lands around
+7 GB VRAM. Then in `.env`:
+
+```bash
+CTX_SIZE=131072
+CTX_SAFETY_MARGIN=512
+MAX_TOKENS=24576          # ~8K thinking + ~16K answer headroom
+HUNK_CONTEXT_LINES=10
+MAX_DIFF_BYTES=240000
+```
+
+Prompt budget: `131072 - 512 - 24576 = 105984` tokens ≈ ~300 KB of diff
+possible (capped earlier by `MAX_DIFF_BYTES`), ~2000+ changed lines per review.
+
+For a 64K-ctx ~5.5 GB VRAM setup (same reasoning flags, smaller window):
+
+```bash
+CTX_SIZE=65536
+MAX_TOKENS=16384
+HUNK_CONTEXT_LINES=8
+MAX_DIFF_BYTES=110000
+```
+
+Prompt budget: ~48 K tokens ≈ ~130 KB, ~800–1500 changed lines.
+
 ## What the reviewer optimizes for
 
 - **Triage gate**: lockfiles, binaries, minified, whitespace-only, dependency-only PRs auto-approved without calling the model.
-- **Tight prompt**: U20 diff context, changed-symbol extraction + git grep caller hits, compact one-line comment summaries.
+- **Noise filter**: lockfiles, binaries, snapshots, fonts, migrations (`**/migrations/*.{js,ts,sql}`), and CHANGELOGs are excluded from the diff sent to the model. When any file is filtered, the PR title and description are also redacted in the prompt (they often reference excluded files, which would otherwise spiral the model into "the diff doesn't match the title" loops).
+- **Diff line annotation**: every added line is pre-prefixed `+file:line| …` before being sent. Lets the model cite `file:line` in findings without re-computing offsets from hunk headers.
+- **PR title sanitization**: brackets and parens are stripped before injecting the title (`[OGENG-1234]` → `OGENG-1234`). Stops tokenizer-attention spirals on bracketed Jira IDs.
+- **Tight prompt**: configurable diff context, changed-symbol extraction + git grep caller hits, compact one-line comment summaries.
 - **No prior-self echo**: the bot's own past comments (plus `SKIP_PRIOR_AUTHORS` + `VERIFY_BOT`) are filtered out so it never restates itself across re-reviews.
 - **Active threads only**: unresolved, non-outdated review threads pulled via GraphQL — resolved/outdated ones ignored.
 - **Incremental mode**: prior reviewed SHA inferred from the bot's last comment timestamp; only the new range is reviewed.
+- **Streaming with newline-safe parser**: SSE deltas are appended directly to `/tmp/last-content.txt` and `/tmp/last-reasoning.txt` (bash `$(...)` strips trailing newlines, which would flatten the review's markdown — the worker uses pipe-to-file instead). Tail those files to watch generation live.
 - **Strict template**: model output forced into a known shape; conclusion line drives auto-approve (only fires when `APPROVED` present and `NEEDS` absent).
 - **VRAM hygiene**: each worker run erases llama-server slot 0 on exit; optional full `LLAMA_UNIT` restart between batches via `RESTART_LLAMA=1`.
 
