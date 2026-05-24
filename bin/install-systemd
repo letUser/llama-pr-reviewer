@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Render systemd unit templates with this checkout's absolute path and link them
+# into the user's systemd --user directory.
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+TEMPLATE_DIR="$REPO_DIR/systemd"
+
+mkdir -p "$UNIT_DIR"
+
+shopt -s nullglob
+for tmpl in "$TEMPLATE_DIR"/*.in; do
+    out="$UNIT_DIR/$(basename "${tmpl%.in}")"
+    sed "s|@INSTALL_DIR@|$REPO_DIR|g" "$tmpl" > "$out"
+    echo "rendered $out"
+done
+
+for unit in "$TEMPLATE_DIR"/*.timer "$TEMPLATE_DIR"/*.service; do
+    [[ "$unit" == *.in ]] && continue
+    [[ -e "$unit" ]] || continue
+    out="$UNIT_DIR/$(basename "$unit")"
+    ln -sf "$unit" "$out"
+    echo "linked   $out -> $unit"
+done
+
+systemctl --user daemon-reload
+echo
+echo "next: systemctl --user enable --now pr-scan.timer"

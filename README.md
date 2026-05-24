@@ -79,16 +79,14 @@ Required env vars (see `.env.example`):
 
 ### Scheduled scan via systemd --user
 
-Sample units in `systemd/`. Link them in-place (edits to the unit files in this repo take effect after `daemon-reload`):
+Unit templates in `systemd/` use `@INSTALL_DIR@` placeholders. `bin/install-systemd` renders them with this checkout's absolute path into `~/.config/systemd/user/`:
 
 ```bash
-systemctl --user link "$PWD/systemd/pr-scan.service"
-systemctl --user link "$PWD/systemd/pr-scan.timer"
-systemctl --user daemon-reload
+./bin/install-systemd
 systemctl --user enable --now pr-scan.timer
 ```
 
-Note: paths must be absolute (hence `$PWD/...`). Moving or renaming this directory breaks the symlinks — re-run the `link` commands.
+Moving the repo? Re-run `./bin/install-systemd` from the new location.
 
 Default cadence: every 30 minutes (edit timer to taste).
 

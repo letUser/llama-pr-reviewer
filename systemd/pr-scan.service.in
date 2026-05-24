@@ -3,7 +3,7 @@ Description=Scan open PRs and queue reviews
 
 [Service]
 Type=oneshot
-ExecStart=%h/Documents/local-services/pr-reviewer/bin/scan-open-prs
+ExecStart=@INSTALL_DIR@/bin/scan-open-prs
 
 [Install]
 WantedBy=default.target
