@@ -92,3 +92,23 @@ EOF
     || echo "WARN: gh pr review --approve failed."
   rm -f pr-review.md
 }
+
+# Post a "needs human review" comment (no approve) and exit 0.
+# Mentions $BOT_OWNER to trigger GitHub notification.
+# $1=reason, $2=pr_number, $3=full_repo, $4=pr_title
+triage_skip_human_review() {
+  local reason="$1" pr_number="$2" full_repo="$3" pr_title="$4"
+  local mention=""
+  [[ -n "$BOT_OWNER" ]] && mention=" @${BOT_OWNER}"
+  cat > pr-review.md <<EOF
+# PR #$pr_number Review — $pr_title
+
+**Skipped:** $reason.
+
+Exceeds size limit for automated review. Needs human review.${mention}
+
+**Conclusion:** NEEDS_REVIEW
+EOF
+  gh pr comment "$pr_number" --repo "$full_repo" --body-file pr-review.md
+  rm -f pr-review.md
+}

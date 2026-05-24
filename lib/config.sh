@@ -26,8 +26,9 @@ resolve_date_cmd() {
 # Budget — tuned for ~12k useful tokens
 init_budgets() {
   MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-120000}"
+  OVERSIZE_DIFF_BYTES="${OVERSIZE_DIFF_BYTES:-360000}" # Hard cap: skip model + request human review.
   MAX_PR_BODY_BYTES="${MAX_PR_BODY_BYTES:-1500}"
-  HUNK_CONTEXT_LINES="${HUNK_CONTEXT_LINES:-20}"
+  HUNK_CONTEXT_LINES="${HUNK_CONTEXT_LINES:-3}" # Default 3 (git/gh standard); avoid >5 — bloats tokens.
   MAX_SYMBOLS="${MAX_SYMBOLS:-15}"
   MAX_CALLERS_PER_SYMBOL="${MAX_CALLERS_PER_SYMBOL:-3}"
   MAX_COMMENT_BODY="${MAX_COMMENT_BODY:-200}"
@@ -37,13 +38,14 @@ init_budgets() {
 
   # llama-server context size. prompt + MAX_TOKENS must fit.
   CTX_SIZE="${CTX_SIZE:-65536}"
-  CTX_SAFETY_MARGIN="${CTX_SAFETY_MARGIN:-512}"
+  CTX_SAFETY_MARGIN="${CTX_SAFETY_MARGIN:-2048}"
 
   MAX_TITLE_LEN="${MAX_TITLE_LEN:-60}"
 
   # Tag a verifier bot at end of review when findings need second-pair-of-eyes.
   # Mention is only appended for NEEDS CHANGES / NEEDS CLARIFICATION conclusions.
   VERIFY_BOT="${VERIFY_BOT:-}"
+  BOT_OWNER="${BOT_OWNER:-}" # GitHub login @-mentioned on oversize-diff skip.
 
   # Comma-separated bot logins to exclude when fetching prior comments/reviews.
   SKIP_PRIOR_AUTHORS="${SKIP_PRIOR_AUTHORS:-}"

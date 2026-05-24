@@ -179,6 +179,13 @@ CHANGED_FILES="$(git diff --name-only "$DIFF_BASE..$HEAD_SHA" -- "${NOISE_PATHSP
 NOISE_FILTERED=0
 [[ "$CHANGED_FILES" != "$CHANGED_FILES_ALL" ]] && NOISE_FILTERED=1
 DIFF_BYTES="${#DIFF_RAW}"
+if (( DIFF_BYTES > OVERSIZE_DIFF_BYTES )); then
+  echo "Oversize skip: diff $DIFF_BYTES bytes > $OVERSIZE_DIFF_BYTES."
+  triage_skip_human_review "diff $DIFF_BYTES bytes exceeds OVERSIZE_DIFF_BYTES=$OVERSIZE_DIFF_BYTES" \
+    "$PR_NUMBER" "$FULL_REPO" "$PR_TITLE"
+  echo "Done (oversize skip)."
+  exit 0
+fi
 if (( DIFF_BYTES > MAX_DIFF_BYTES )); then
   DIFF="${DIFF_RAW:0:$MAX_DIFF_BYTES}"
   DIFF_TRUNCATED_NOTE="

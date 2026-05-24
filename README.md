@@ -7,6 +7,23 @@ clean runs.
 No agent loop, no tool calls — one model invocation per PR. Tuned for fast,
 deterministic batch review on a single GPU box.
 
+## Hardware requirements
+
+Designed to run fully local on consumer GPUs. Reference target: a 9B-class Q4
+reasoning model with Q8 KV cache and partial offload on **8 GB VRAM**.
+
+| Tier | VRAM | Model | Offload | KV cache | Context | Throughput |
+|------|------|-------|---------|----------|---------|------------|
+| Minimum | 6 GB | 9B Q4 | `-ngl 18` | Q8 | 64K | ~800–1500 changed LOC per review |
+| Reference | 8 GB | 9B Q4 | `-ngl 24` | Q8 | 128K | ~2K changed LOC per review |
+| Headroom | 12–16 GB | 9B Q4 or 14B Q4 | full (`-ngl 99`) | F16 | 256K+ | Larger diffs, bigger reasoning budgets, faster wall time |
+
+The 8 GB row is the actively tested configuration.
+
+Host requirements are minimal: `bash`, `jq`, `curl`, `git`. No GPU-side
+dependencies beyond `llama-server`. Tuning flags and `.env` values for each
+tier are in [Example: 8 GB VRAM with Q8 KV cache + reasoning model](#example-8-gb-vram-with-q8-kv-cache--reasoning-model).
+
 ## Pipeline
 
 ```
@@ -111,15 +128,17 @@ Default cadence: every 30 minutes (edit timer to taste).
 | `SKIP_BASE_PREFIXES` | `release/` | Base ref prefixes to skip |
 | `SKIP_AUTHORS` | — | PR authors to skip entirely |
 | `SKIP_PRIOR_AUTHORS` | — | Comment authors whose prior reviews are hidden from model |
-| `VERIFY_BOT` | — | GitHub login to `@`-mention at end of review |
+| `VERIFY_BOT` | — | GitHub login of verifier bot to `@`-mention at end of review (no `@`) |
 | `RESTART_LLAMA` | `0` | Restart llama-server systemd unit between batches (frees VRAM) |
 | `LLAMA_UNIT` | — | systemd --user unit name (required if `RESTART_LLAMA=1`) |
 | `NOTIFY_TARGET` | — | Notification target ID for queue start/done events (requires `openclaw`). Empty = no notify |
 | `NOTIFY_CHANNEL` | `telegram` | openclaw channel (`telegram`, `whatsapp`, etc — any channel openclaw supports) |
-| `MAX_DIFF_BYTES` | `120000` | Diff truncation budget |
+| `MAX_DIFF_BYTES` | `120000` | Diff truncation budget (soft cap) |
+| `OVERSIZE_DIFF_BYTES` | `360000` | Hard cap. Above this, model is skipped; reviewer posts "needs human review" + `@BOT_OWNER` mention |
+| `BOT_OWNER` | — | GitHub login of bot owner to `@`-mention (no `@`) |
 | `MAX_TOKENS` | `16384` | Output token cap (`n_predict`). Reasoning models burn tokens before answer — raise on `finish_reason=length` |
 | `CTX_SIZE` | `65536` | llama-server context window. Worker aborts (exit 5) if prompt + `MAX_TOKENS` won't fit |
-| `CTX_SAFETY_MARGIN` | `512` | Tokens kept free below `CTX_SIZE` |
+| `CTX_SAFETY_MARGIN` | `2048` | Tokens kept free below `CTX_SIZE` |
 | `PR_REVIEWER_HOME` | script dir | Override location of `.env`, `.cache`, `.share` |
 | `WORKSPACE_BASE` | `$PR_REVIEWER_HOME/.share` | Override clone location |
 | `WORKER` | sibling `review-pr` | Path to worker used by queue runner |
@@ -139,15 +158,21 @@ The prompt holds the diff, changed-symbol context, active review threads, and th
 template. Diff bytes-to-tokens ratio is ~2.8–3.5 for code. Worker aborts (exit 5)
 if the assembled prompt won't fit.
 
-`MAX_DIFF_BYTES` is a hard truncation cap on the diff alone — set it so the
-worst-case diff still leaves room for the rest of the prompt.
+`MAX_DIFF_BYTES` is a soft truncation cap on the diff alone — diffs above it
+are truncated and still reviewed. Set it so the worst-case (truncated) diff
+still leaves room for the rest of the prompt.
 
-`HUNK_CONTEXT_LINES` is the `-U<N>` passed to `git diff`. Lower values shrink the
-diff at the cost of surrounding-code context for the model:
+`OVERSIZE_DIFF_BYTES` is a hard cap. Above it, the model is skipped entirely —
+the reviewer posts a `**Conclusion:** NEEDS_REVIEW` comment that `@`-mentions
+`BOT_OWNER` to trigger a GitHub notification. Use this for mega-PRs where
+truncated review is worse than no review.
 
-- `U20` (ambitious) — model sees full function bodies. Best quality.
-- `U10` (default) — ~half the context overhead per hunk. Good balance.
-- `U3` — git default. Tight; model may miss why a change matters.
+`HUNK_CONTEXT_LINES` is the `-U<N>` passed to `git diff`. Higher values bloat
+tokens without proportional quality gain:
+
+- `U3` (default) — git/gh standard. What CodeRabbit, Claude, Copilot use. Recommended.
+- `U5` — marginal extra context. Acceptable ceiling.
+- `>U5` — diminishing returns; ships redundant lines, eats prompt budget.
 
 ### Failure modes
 
@@ -207,13 +232,13 @@ With a 9B-class Q4 model and partial offload (`-ngl 24`) this lands around
 
 ```bash
 CTX_SIZE=131072
-CTX_SAFETY_MARGIN=512
+CTX_SAFETY_MARGIN=2048
 MAX_TOKENS=24576          # ~8K thinking + ~16K answer headroom
-HUNK_CONTEXT_LINES=10
+HUNK_CONTEXT_LINES=3
 MAX_DIFF_BYTES=240000
 ```
 
-Prompt budget: `131072 - 512 - 24576 = 105984` tokens ≈ ~300 KB of diff
+Prompt budget: `131072 - 2048 - 24576 = 104448` tokens ≈ ~300 KB of diff
 possible (capped earlier by `MAX_DIFF_BYTES`), ~2000+ changed lines per review.
 
 For a 64K-ctx ~5.5 GB VRAM setup (same reasoning flags, smaller window):
@@ -221,7 +246,7 @@ For a 64K-ctx ~5.5 GB VRAM setup (same reasoning flags, smaller window):
 ```bash
 CTX_SIZE=65536
 MAX_TOKENS=16384
-HUNK_CONTEXT_LINES=8
+HUNK_CONTEXT_LINES=3
 MAX_DIFF_BYTES=110000
 ```
 
