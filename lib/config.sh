@@ -23,9 +23,9 @@ resolve_date_cmd() {
   fi
 }
 
-# Budget — tuned for ~12k useful tokens
+# Budget — tuned for ~24k useful tokens
 init_budgets() {
-  MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-120000}"
+  MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-240000}"
   OVERSIZE_DIFF_BYTES="${OVERSIZE_DIFF_BYTES:-360000}" # Hard cap: skip model + request human review.
   MAX_PR_BODY_BYTES="${MAX_PR_BODY_BYTES:-1500}"
   HUNK_CONTEXT_LINES="${HUNK_CONTEXT_LINES:-3}" # Default 3 (git/gh standard); avoid >5 — bloats tokens.
@@ -34,10 +34,10 @@ init_budgets() {
   MAX_COMMENT_BODY="${MAX_COMMENT_BODY:-200}"
 
   # thinking mode eats tokens before answer. Give big budget.
-  MAX_TOKENS="${MAX_TOKENS:-16384}"
+  MAX_TOKENS="${MAX_TOKENS:-24576}"
 
   # llama-server context size. prompt + MAX_TOKENS must fit.
-  CTX_SIZE="${CTX_SIZE:-65536}"
+  CTX_SIZE="${CTX_SIZE:-131072}"
   CTX_SAFETY_MARGIN="${CTX_SAFETY_MARGIN:-2048}"
 
   MAX_TITLE_LEN="${MAX_TITLE_LEN:-60}"
