@@ -491,7 +491,18 @@ REVIEW_THREADS_ACTIVE="$(
 [[ -z "$REVIEW_THREADS_ACTIVE" ]]  && REVIEW_THREADS_ACTIVE="(none)"
 
 # --- Build prompt ---
-TEMPLATE_FULL="# PR #$PR_NUMBER Review — $PR_TITLE_HEADER
+# Suppress the title from the header when noise filter ran, so the model
+# doesn't try to reconcile the redacted metadata title with a real one in the
+# template (causes a "what title do I write?" spiral).
+if (( NOISE_FILTERED )); then
+  HEADER_FULL="# PR #$PR_NUMBER Review"
+  HEADER_INCREMENTAL="# PR #$PR_NUMBER Re-review (incremental)"
+else
+  HEADER_FULL="# PR #$PR_NUMBER Review — $PR_TITLE_HEADER"
+  HEADER_INCREMENTAL="# PR #$PR_NUMBER Re-review (incremental) — $PR_TITLE_HEADER"
+fi
+
+TEMPLATE_FULL="$HEADER_FULL
 
 ## 📝 Summary
 <1-3 sentences.>
@@ -510,7 +521,7 @@ TEMPLATE_FULL="# PR #$PR_NUMBER Review — $PR_TITLE_HEADER
 **Findings:** None.
 **Conclusion:** APPROVED ✅"
 
-TEMPLATE_INCREMENTAL="# PR #$PR_NUMBER Re-review (incremental) — $PR_TITLE_HEADER
+TEMPLATE_INCREMENTAL="$HEADER_INCREMENTAL
 
 ## 🆕 Commits since $PRIOR_REVIEW_SHA
 - <sha7> <subject>
@@ -658,9 +669,9 @@ REQ_JSON="$(jq -n \
   }'
 )"
 
-STREAM_FILE="/tmp/last-stream.sse"
-REASONING_FILE="/tmp/last-reasoning.txt"
-CONTENT_FILE="/tmp/last-content.txt"
+STREAM_FILE="$LOCK_DIR/last-stream.sse"
+REASONING_FILE="$LOCK_DIR/last-reasoning.txt"
+CONTENT_FILE="$LOCK_DIR/last-content.txt"
 : > "$STREAM_FILE"
 : > "$REASONING_FILE"
 : > "$CONTENT_FILE"

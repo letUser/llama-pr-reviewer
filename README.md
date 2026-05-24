@@ -217,9 +217,43 @@ Prompt budget: ~48 K tokens ≈ ~130 KB, ~800–1500 changed lines.
 - **No prior-self echo**: the bot's own past comments (plus `SKIP_PRIOR_AUTHORS` + `VERIFY_BOT`) are filtered out so it never restates itself across re-reviews.
 - **Active threads only**: unresolved, non-outdated review threads pulled via GraphQL — resolved/outdated ones ignored.
 - **Incremental mode**: prior reviewed SHA inferred from the bot's last comment timestamp; only the new range is reviewed.
-- **Streaming with newline-safe parser**: SSE deltas are appended directly to `/tmp/last-content.txt` and `/tmp/last-reasoning.txt` (bash `$(...)` strips trailing newlines, which would flatten the review's markdown — the worker uses pipe-to-file instead). Tail those files to watch generation live.
+- **Streaming with newline-safe parser**: SSE deltas are appended directly to `$PR_REVIEWER_HOME/.cache/last-content.txt` and `last-reasoning.txt` (bash `$(...)` strips trailing newlines, which would flatten the review's markdown — the worker uses pipe-to-file instead). Tail those files to watch generation live.
 - **Strict template**: model output forced into a known shape; conclusion line drives auto-approve (only fires when `APPROVED` present and `NEEDS` absent).
 - **VRAM hygiene**: each worker run erases llama-server slot 0 on exit; optional full `LLAMA_UNIT` restart between batches via `RESTART_LLAMA=1`.
+
+## Debugging
+
+Per-run streaming artifacts land in `$PR_REVIEWER_HOME/.cache/` (default: `pr-reviewer/.cache/`). Overwritten on every run.
+
+| File | Contents |
+|------|----------|
+| `last-stream.sse` | Raw SSE response from `/v1/chat/completions` — usage block, finish_reason, every delta |
+| `last-content.txt` | Concatenated `delta.content` — the review markdown the model emitted |
+| `last-reasoning.txt` | Concatenated `delta.reasoning_content` — empty for non-reasoning models (expected) |
+| `review.lock` | `flock` queue lock for serial worker runs |
+
+Watch generation live:
+
+```bash
+tail -f pr-reviewer/.cache/last-content.txt
+tail -f pr-reviewer/.cache/last-reasoning.txt   # reasoning models only
+```
+
+Inspect token usage / finish reason of the last run:
+
+```bash
+grep '^data: ' pr-reviewer/.cache/last-stream.sse \
+  | sed 's/^data: //' \
+  | jq -rs 'map(select(.usage)) | last | .usage'
+```
+
+Common exit-4 triage:
+
+- `last-content.txt` empty + `last-reasoning.txt` large → reasoning budget eaten before answer. Cap with `--reasoning-budget`, raise `MAX_TOKENS`, or shrink prompt.
+- `last-content.txt` populated but missing `**Conclusion:**` → model drifted off template. Inspect tail, then lower temperature or tighten `SYSTEM_PROMPT`.
+- Both empty → server error. Check `last-stream.sse` head for HTTP/JSON error from llama-server.
+
+Non-reasoning models: `last-reasoning.txt` stays empty; this is normal. The worker's `reasoning_content // ""` jq fallback handles the absent field — no behavior change.
 
 ## Notifications
 
