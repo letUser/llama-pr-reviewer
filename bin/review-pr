@@ -2,22 +2,34 @@
 # Scripted PR reviewer: pre-fetches all data, asks the local LLM for a single
 # review markdown, posts it via gh. No agent loop, no tool calls.
 #
-# Optimization pass:
-#   - Triage gate (lockfile/whitespace/empty/binary-only → skip model)
-#   - Tight byte budget tuned for Q4 ~12k useful tokens
-#   - Diff with -U20 context replaces full-file inlining
-#   - Changed-symbol extraction + git grep caller hits
-#   - Compact one-line comments instead of raw JSON
-#   - Diff noise stripping, resolved-thread filtering
+# Orchestrator. Logic lives in $DATA_DIR/lib/*.sh:
+#   config.sh   — env loading, budgets, noise pathspecs, date cmd
+#   triage.sh   — noise/dep/whitespace classification + auto-approve skip path
+#   diff.sh     — diff stripping, line annotation, symbol + caller extraction
+#   github.sh   — prior reviews/comments/threads fetchers
+#   prompt.sh   — system + user prompt + review template assembly
+#   llama.sh    — tokenize preflight, SSE stream, output validation
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${PR_REVIEWER_HOME:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+LIB_DIR="$DATA_DIR/lib"
+
+# shellcheck source=../lib/config.sh
+source "$LIB_DIR/config.sh"
+# shellcheck source=../lib/triage.sh
+source "$LIB_DIR/triage.sh"
+# shellcheck source=../lib/diff.sh
+source "$LIB_DIR/diff.sh"
+# shellcheck source=../lib/github.sh
+source "$LIB_DIR/github.sh"
+# shellcheck source=../lib/prompt.sh
+source "$LIB_DIR/prompt.sh"
+# shellcheck source=../lib/llama.sh
+source "$LIB_DIR/llama.sh"
+
 CONFIG="$DATA_DIR/.env"
-if [[ -f "$CONFIG" ]]; then
-  # shellcheck source=/dev/null
-  source "$CONFIG"
-fi
+load_env_file "$CONFIG"
 
 LOCK_DIR="$DATA_DIR/.cache"
 LOCK_FILE="$LOCK_DIR/review.lock"
@@ -40,96 +52,9 @@ REPO_DIR="$WORKSPACE_BASE/$REPO"
 LLAMA_URL="${LLAMA_URL:?LLAMA_URL env var required (e.g. http://127.0.0.1:8082). Set in $CONFIG}"
 LLAMA_MODEL="${LLAMA_MODEL:?LLAMA_MODEL env var required (model name served by llama-server). Set in $CONFIG}"
 
-# Locate a GNU-compatible date (BSD/macOS `date` lacks `-d`).
-if date -d @0 +%s >/dev/null 2>&1; then
-  DATE_CMD=date
-elif command -v gdate >/dev/null 2>&1 && gdate -d @0 +%s >/dev/null 2>&1; then
-  DATE_CMD=gdate
-else
-  echo "ERROR: GNU date required. On macOS: brew install coreutils." >&2
-  exit 1
-fi
+resolve_date_cmd
+init_budgets
 
-# Budget — tuned for ~12k useful tokens
-MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-120000}"
-MAX_PR_BODY_BYTES="${MAX_PR_BODY_BYTES:-1500}"
-HUNK_CONTEXT_LINES="${HUNK_CONTEXT_LINES:-20}"
-MAX_SYMBOLS="${MAX_SYMBOLS:-15}"
-MAX_CALLERS_PER_SYMBOL="${MAX_CALLERS_PER_SYMBOL:-3}"
-MAX_COMMENT_BODY="${MAX_COMMENT_BODY:-200}"
-
-# thinking mode eats tokens before answer. Give big budget.
-MAX_TOKENS="${MAX_TOKENS:-16384}"
-
-# llama-server context size. prompt + MAX_TOKENS must fit.
-CTX_SIZE="${CTX_SIZE:-65536}"
-# Safety margin (tokens) kept free below ctx limit.
-CTX_SAFETY_MARGIN="${CTX_SAFETY_MARGIN:-512}"
-
-# Cap title length used in markdown header (avoid huge h1 lines).
-MAX_TITLE_LEN="${MAX_TITLE_LEN:-60}"
-
-# Tag a verifier bot at end of review when findings need second-pair-of-eyes.
-# Set VERIFY_BOT=<login> (no @). Unset = no mention ever appended.
-# Mention is only appended for NEEDS CHANGES / NEEDS CLARIFICATION conclusions —
-# APPROVED / APPROVED WITH CAUTION never tag the bot (avoids triggering a full
-# re-review when we already accept the PR).
-VERIFY_BOT="${VERIFY_BOT:-}"
-
-# Comma-separated bot logins to exclude when fetching prior comments/reviews
-# (avoid feeding our own past reviews back into the model as "prior findings").
-# Unset = skip nothing. VERIFY_BOT (if set) auto-added below.
-SKIP_PRIOR_AUTHORS="${SKIP_PRIOR_AUTHORS:-}"
-if [[ -n "$VERIFY_BOT" ]]; then
-  SKIP_PRIOR_AUTHORS="${SKIP_PRIOR_AUTHORS:+$SKIP_PRIOR_AUTHORS,}$VERIFY_BOT,${VERIFY_BOT}[bot]"
-fi
-
-# Pathspecs excluded from the diff sent to the model. Triage gate already
-# auto-skips all-noise PRs; these patterns drop noise hunks from mixed PRs so
-# the model never reviews lockfiles, binaries, minified bundles, etc.
-NOISE_PATHSPECS=(
-  ':(exclude,glob)**/*.lock'
-  ':(exclude,glob)**/*.lockb'
-  ':(exclude,glob)**/package-lock.json'
-  ':(exclude,glob)**/yarn.lock'
-  ':(exclude,glob)**/pnpm-lock.yaml'
-  ':(exclude,glob)**/Cargo.lock'
-  ':(exclude,glob)**/Gemfile.lock'
-  ':(exclude,glob)**/poetry.lock'
-  ':(exclude,glob)**/Pipfile.lock'
-  ':(exclude,glob)**/composer.lock'
-  ':(exclude,glob)**/*.min.js'
-  ':(exclude,glob)**/*.min.css'
-  ':(exclude,glob)**/*.map'
-  ':(exclude,glob)**/*.svg'
-  ':(exclude,glob)**/*.png'
-  ':(exclude,glob)**/*.jpg'
-  ':(exclude,glob)**/*.jpeg'
-  ':(exclude,glob)**/*.gif'
-  ':(exclude,glob)**/*.ico'
-  ':(exclude,glob)**/*.pdf'
-  ':(exclude,glob)**/*.bin'
-  ':(exclude,glob)**/*.woff'
-  ':(exclude,glob)**/*.woff2'
-  ':(exclude,glob)**/*.ttf'
-  ':(exclude,glob)**/*.eot'
-  ':(exclude,glob)**/*.snap'
-  ':(exclude,glob)**/*.snapshot'
-  ':(exclude,glob)**/CHANGELOG.md'
-  ':(exclude,glob)**/CHANGELOG'
-  ':(exclude,glob)**/migrations/*.js'
-  ':(exclude,glob)**/migrations/*.ts'
-  ':(exclude,glob)**/migrations/*.sql'
-)
-
-# Comma-separated GitHub logins whose PRs we skip entirely. Unset = skip none.
-SKIP_AUTHORS="${SKIP_AUTHORS:-}"
-
-cleanup_vram() {
-  curl -s -X POST "$LLAMA_URL/slots/0?action=erase" >/dev/null 2>&1 \
-    && echo "Cleared llama-server slot 0." \
-    || echo "WARNING: failed to erase llama-server slot 0."
-}
 trap cleanup_vram EXIT
 
 mkdir -p "$WORKSPACE_BASE"
@@ -232,54 +157,6 @@ else
   COMMITS_SINCE=""
 fi
 
-# Diff with wider context (U20). Strip noise lines.
-strip_diff_noise() {
-  sed -E \
-    -e '/^index [0-9a-f]+\.\.[0-9a-f]+/d' \
-    -e '/^similarity index /d' \
-    -e '/^dissimilarity index /d' \
-    -e '/^rename from /d' \
-    -e '/^rename to /d' \
-    -e '/^new file mode /d' \
-    -e '/^deleted file mode /d' \
-    -e '/^old mode /d' \
-    -e '/^new mode /d' \
-    -e '/^Binary files .* differ$/d'
-}
-
-# Prefix each added line ("+...") with "+file:lineN| ". Tracks current file from
-# "+++ b/PATH" and current line number from hunk headers. Lets the model cite
-# line numbers without arithmetic on hunk offsets.
-annotate_diff_lines() {
-  awk '
-    /^\+\+\+ b\// {
-      file = substr($0, 7)
-      print
-      next
-    }
-    /^\+\+\+ / || /^--- / || /^diff --git / { print; next }
-    /^@@/ {
-      if (match($0, /\+[0-9]+/)) {
-        new_line = substr($0, RSTART+1, RLENGTH-1) + 0
-      }
-      print
-      next
-    }
-    /^\+/ {
-      printf "+%s:%d| %s\n", file, new_line, substr($0, 2)
-      new_line++
-      next
-    }
-    /^-/ { print; next }
-    /^ / {
-      new_line++
-      print
-      next
-    }
-    { print }
-  '
-}
-
 # Raw (unfiltered) diff + file list — used only for the triage gate so that
 # all-noise PRs still get auto-skipped. The filtered versions sent to the model
 # are computed after the triage gate.
@@ -287,86 +164,17 @@ DIFF_RAW_FULL="$(git diff "-U${HUNK_CONTEXT_LINES}" "$DIFF_BASE..$HEAD_SHA" | st
 CHANGED_FILES_ALL="$(git diff --name-only "$DIFF_BASE..$HEAD_SHA" 2>/dev/null || true)"
 
 # --- Triage gate: skip model entirely on trivial diffs ---
-is_noise_path() {
-  case "$1" in
-    *.lock|*.lockb|*package-lock.json|*yarn.lock|*pnpm-lock.yaml|*Cargo.lock|*Gemfile.lock|*poetry.lock|*Pipfile.lock|*composer.lock) return 0 ;;
-    *.min.js|*.min.css|*.map) return 0 ;;
-    *.svg|*.png|*.jpg|*.jpeg|*.gif|*.ico|*.pdf|*.bin|*.woff|*.woff2|*.ttf|*.eot) return 0 ;;
-    *.snap|*.snapshot) return 0 ;;
-    *)
-      case "$(basename "$1")" in
-        CHANGELOG.md|CHANGELOG) return 0 ;;
-        *) return 1 ;;
-      esac
-      ;;
-  esac
-}
-
-# Dep manifests: meaningful files that, when changed alongside only lockfiles,
-# still represent a dep-only PR (no application logic).
-is_dep_manifest() {
-  case "$(basename "$1")" in
-    package.json|composer.json|Gemfile|requirements.txt|Pipfile|go.mod|go.sum) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-TRIAGE_SKIP_REASON=""
-if [[ -z "$DIFF_RAW_FULL" ]]; then
-  TRIAGE_SKIP_REASON="empty diff"
-elif [[ -z "$CHANGED_FILES_ALL" ]]; then
-  TRIAGE_SKIP_REASON="no changed files"
-else
-  all_skip=1
-  has_dep_manifest=0
-  while IFS= read -r f; do
-    [[ -z "$f" ]] && continue
-    if is_dep_manifest "$f"; then
-      has_dep_manifest=1
-      continue
-    fi
-    if ! is_noise_path "$f"; then
-      all_skip=0
-      break
-    fi
-  done <<<"$CHANGED_FILES_ALL"
-  if (( all_skip == 1 )); then
-    if (( has_dep_manifest == 1 )); then
-      TRIAGE_SKIP_REASON="dependency-only update"
-    else
-      TRIAGE_SKIP_REASON="lockfile/generated/binary-only diff"
-    fi
-  else
-    # Whitespace-only check on the actual code changes.
-    WS_DIFF="$(git diff -w "$DIFF_BASE..$HEAD_SHA" 2>/dev/null || true)"
-    if [[ -z "$WS_DIFF" ]]; then
-      TRIAGE_SKIP_REASON="whitespace-only diff"
-    fi
-  fi
-fi
+classify_triage "$DIFF_RAW_FULL" "$CHANGED_FILES_ALL" "$DIFF_BASE" "$HEAD_SHA"
 
 if [[ -n "$TRIAGE_SKIP_REASON" ]]; then
   echo "Triage skip: $TRIAGE_SKIP_REASON."
-  cat > pr-review.md <<EOF
-# PR #$PR_NUMBER Review — $PR_TITLE
-
-**Auto-skipped:** $TRIAGE_SKIP_REASON. No model review needed.
-
-**Conclusion:** APPROVED ✅
-EOF
-  gh pr comment "$PR_NUMBER" --repo "$FULL_REPO" --body-file pr-review.md
-  gh pr review "$PR_NUMBER" --repo "$FULL_REPO" --approve \
-    --body "Auto-approved: $TRIAGE_SKIP_REASON." \
-    || echo "WARN: gh pr review --approve failed."
-  rm -f pr-review.md
+  triage_skip_approve "$TRIAGE_SKIP_REASON" "$PR_NUMBER" "$FULL_REPO" "$PR_TITLE"
   echo "Done (triage skip)."
   exit 0
 fi
 
 # --- Filtered diff + file list sent to model ---
-# Strip noise paths (lockfiles, binaries, minified, changelog) via pathspecs so
-# the model only ever sees real code. Truncation applied to the filtered diff.
-DIFF_RAW="$(git diff "-U${HUNK_CONTEXT_LINES}" "$DIFF_BASE..$HEAD_SHA" -- "${NOISE_PATHSPECS[@]}" | strip_diff_noise | annotate_diff_lines || true)"
+DIFF_RAW="$(git diff "-U${HUNK_CONTEXT_LINES}" "$DIFF_BASE..$HEAD_SHA" -- "${NOISE_PATHSPECS[@]}" | strip_diff_noise || true)"
 CHANGED_FILES="$(git diff --name-only "$DIFF_BASE..$HEAD_SHA" -- "${NOISE_PATHSPECS[@]}" 2>/dev/null || true)"
 NOISE_FILTERED=0
 [[ "$CHANGED_FILES" != "$CHANGED_FILES_ALL" ]] && NOISE_FILTERED=1
@@ -385,105 +193,27 @@ fi
 # fire (e.g. unusual edge case), fall back to a non-model skip.
 if [[ -z "$DIFF_RAW" || -z "$CHANGED_FILES" ]]; then
   echo "Triage skip: all changed paths excluded by noise filter."
-  cat > pr-review.md <<EOF
-# PR #$PR_NUMBER Review — $PR_TITLE
-
-**Auto-skipped:** all changed paths excluded by noise filter. No model review needed.
-
-**Conclusion:** APPROVED ✅
-EOF
-  gh pr comment "$PR_NUMBER" --repo "$FULL_REPO" --body-file pr-review.md
-  gh pr review "$PR_NUMBER" --repo "$FULL_REPO" --approve \
-    --body "Auto-approved: noise-only diff." \
-    || echo "WARN: gh pr review --approve failed."
-  rm -f pr-review.md
+  triage_skip_approve "all changed paths excluded by noise filter" "$PR_NUMBER" "$FULL_REPO" "$PR_TITLE"
   exit 0
 fi
 
 # --- Symbol extraction + caller awareness ---
-# Pull added identifiers from `+` lines matching common decl patterns.
-# Crude regex, language-agnostic. Filters builtins/short names.
-extract_symbols() {
-  # Only added lines (skip `+++` file headers), extract decl identifiers.
-  printf '%s\n' "$DIFF" \
-    | grep -E '^\+[^+]' \
-    | sed -E 's/^\+//' \
-    | grep -oE '(function|def|class|interface|type|fn|func|struct|enum|trait|impl|module|namespace|const|let|var|public|private|protected|static)[[:space:]]+[A-Za-z_][A-Za-z0-9_]+' \
-    | sed -E 's/^[A-Za-z]+[[:space:]]+//' \
-    | awk 'length($0) >= 4' \
-    | grep -Ev '^(if|else|for|while|return|true|false|null|None|self|this|args|kwargs|data|item|value|test|init|main|String|Number|Boolean|Object|Array)$' \
-    | sort -u \
-    | head -n "$MAX_SYMBOLS"
-}
+CHANGED_SYMBOLS="$(extract_symbols "$DIFF" || true)"
+CALLERS_SECTION="$(build_callers_section "$CHANGED_SYMBOLS" "$CHANGED_FILES")"
 
-CHANGED_SYMBOLS="$(extract_symbols || true)"
-
-CALLERS_SECTION=""
-if [[ -n "$CHANGED_SYMBOLS" ]]; then
-  CALLERS_SECTION="## Caller hits for changed symbols
-"
-  while IFS= read -r sym; do
-    [[ -z "$sym" ]] && continue
-    hits="$(git grep -n --fixed-strings "$sym" -- \
-              ':!*test*' ':!*spec*' ':!*__tests__*' ':!*node_modules*' ':!*dist*' ':!*build*' \
-              2>/dev/null \
-              | awk -F: -v changed="$CHANGED_FILES" '
-                  BEGIN { n=split(changed,a,"\n"); for(i=1;i<=n;i++) if(a[i]!="") c[a[i]]=1 }
-                  !($1 in c)' \
-              | head -n "$MAX_CALLERS_PER_SYMBOL" || true)"
-    if [[ -n "$hits" ]]; then
-      CALLERS_SECTION+="
-### \`$sym\`
-\`\`\`
-$hits
-\`\`\`"
-    fi
-  done <<<"$CHANGED_SYMBOLS"
-fi
+# --- Alias long paths to F1/F2/... ---
+# Small reasoning models fragment long paths (digit runs in migration
+# timestamps, compound CamelCase). Replace paths with short aliases in the
+# diff sent to the model; restore real paths in REVIEW_MD post-stream.
+build_alias_map "$CHANGED_FILES"
+DIFF="$(apply_aliases "$DIFF")"
+CALLERS_SECTION="$(apply_aliases "$CALLERS_SECTION")"
 
 # --- Comments (compact one-liners, not JSON) ---
-fetch_inline_comments() {
-  gh api "repos/$FULL_REPO/pulls/$PR_NUMBER/comments" --paginate \
-    --jq "[.[] | select(($SKIP_LOGINS_JQ | index(.user.login // \"\")) == null)] \
-          | map(\"- @\(.user.login) (\(.path):\(.line // .original_line // \"?\")): \\\"\(.body | gsub(\"\\n\"; \" \") | .[0:$MAX_COMMENT_BODY])\\\"\") \
-          | .[]" 2>/dev/null || true
-}
-fetch_issue_comments() {
-  gh api "repos/$FULL_REPO/issues/$PR_NUMBER/comments" --paginate \
-    --jq "[.[] | select(($SKIP_LOGINS_JQ | index(.user.login // \"\")) == null)] \
-          | map(\"- @\(.user.login): \\\"\(.body | gsub(\"\\n\"; \" \") | .[0:$MAX_COMMENT_BODY])\\\"\") \
-          | .[]" 2>/dev/null || true
-}
-fetch_reviews() {
-  gh api "repos/$FULL_REPO/pulls/$PR_NUMBER/reviews" --paginate \
-    --jq "[.[] | select(($SKIP_LOGINS_JQ | index(.user.login // \"\")) == null)] \
-          | map(\"- @\(.user.login) [\(.state)]: \\\"\(.body // \"\" | gsub(\"\\n\"; \" \") | .[0:$MAX_COMMENT_BODY])\\\"\") \
-          | .[]" 2>/dev/null || true
-}
-
 INLINE_COMMENTS="$(fetch_inline_comments)"
 ISSUE_COMMENTS="$(fetch_issue_comments)"
 REVIEWS="$(fetch_reviews)"
-
-# Active (unresolved, non-outdated) review threads only.
-REVIEW_THREADS_ACTIVE="$(
-  gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
-    query($owner:String!,$repo:String!,$number:Int!){
-      repository(owner:$owner,name:$repo){
-        pullRequest(number:$number){
-          reviewThreads(first:50){
-            nodes{ isResolved isOutdated comments(first:5){ nodes{ author{login} path line body } } }
-          }
-        }
-      }
-    }' --jq "
-      [.data.repository.pullRequest.reviewThreads.nodes[]
-       | select(.isResolved == false and .isOutdated == false)
-       | .comments.nodes[]
-       | select(($SKIP_LOGINS_JQ | index(.author.login // \"\")) == null)
-       | \"- @\(.author.login) (\(.path // \"?\"):\(.line // \"?\")): \\\"\(.body | gsub(\"\\n\"; \" \") | .[0:200])\\\"\"]
-       | .[]" 2>/dev/null || true
-)"
+REVIEW_THREADS_ACTIVE="$(fetch_active_review_threads)"
 
 [[ -z "$INLINE_COMMENTS" ]]        && INLINE_COMMENTS="(none)"
 [[ -z "$ISSUE_COMMENTS" ]]         && ISSUE_COMMENTS="(none)"
@@ -491,226 +221,40 @@ REVIEW_THREADS_ACTIVE="$(
 [[ -z "$REVIEW_THREADS_ACTIVE" ]]  && REVIEW_THREADS_ACTIVE="(none)"
 
 # --- Build prompt ---
-# Suppress the title from the header when noise filter ran, so the model
-# doesn't try to reconcile the redacted metadata title with a real one in the
-# template (causes a "what title do I write?" spiral).
-if (( NOISE_FILTERED )); then
-  HEADER_FULL="# PR #$PR_NUMBER Review"
-  HEADER_INCREMENTAL="# PR #$PR_NUMBER Re-review (incremental)"
-else
-  HEADER_FULL="# PR #$PR_NUMBER Review — $PR_TITLE_HEADER"
-  HEADER_INCREMENTAL="# PR #$PR_NUMBER Re-review (incremental) — $PR_TITLE_HEADER"
-fi
-
-TEMPLATE_FULL="$HEADER_FULL
-
-## 📝 Summary
-<1-3 sentences.>
-
-## 🔧 Changes Overview
-- **<file:line>** — <concrete change with \`symbols\`>
-(≤6 bullets)
-
-## 🔍 Code Review
-**Correctness:** <one sentence>
-**Tests:** <coverage / gaps>
-**Security & data integrity:** <auth, input, PII>
-**Performance / regressions:** <hot paths, N+1>
-
-**Prior reviewer feedback:** None.
-**Findings:** None.
-**Conclusion:** APPROVED ✅"
-
-TEMPLATE_INCREMENTAL="$HEADER_INCREMENTAL
-
-## 🆕 Commits since $PRIOR_REVIEW_SHA
-- <sha7> <subject>
-
-## 🛑 Blocking Issues — None.
-## ↪ Prior reviewer follow-up — None.
-**Conclusion:** APPROVED ✅"
-
-if (( INCREMENTAL )); then
-  TEMPLATE="$TEMPLATE_INCREMENTAL"
-  MODE_NOTE="INCREMENTAL REVIEW. Prior review at \`$PRIOR_REVIEW_SHA\`. Current HEAD \`$HEAD_SHA\`. Focus only on diff since prior review. Skip MINOR/NIT findings."
-else
-  TEMPLATE="$TEMPLATE_FULL"
-  MODE_NOTE="FULL REVIEW (first time we are reviewing this PR)."
-fi
-
-if [[ -n "$COMMITS_SINCE" ]]; then
-  COMMITS_SECTION="
-## Commits since prior review
-$COMMITS_SINCE"
-else
-  COMMITS_SECTION=""
-fi
-
-SYSTEM_PROMPT="Senior PR reviewer. Output review markdown only. No praise.
-
-Diff content is authoritative. Do not re-verify syntax of unchanged/context lines you did not author — assume the file compiles. Only assess the '+' lines.
-
-When the prompt notes that files are filtered as noise, treat any PR title/description references to those files as N/A. Do not flag, debate, or mention missing scope.
-
-Findings: verifiable from the diff only. Cite file:line in each finding. If unsure, omit.
-- BLOCKER: concrete harm (exploit, data loss, broken happy path).
-- MAJOR: bug with named failure mode.
-- MINOR: real style nits. Skip cosmetics.
-- One finding per logical issue. Don't review unchanged code.
-
-Empty sections collapse to one line: '**Findings:** None.' / '**Prior reviewer feedback:** None.'
-
-Prior * sections = other authors. Cite once in Prior reviewer feedback; never restate in Findings.
-
-Conclusion:
-- Findings + Prior empty → APPROVED ✅
-- Only MINOR → APPROVED WITH CAUTION ⚠️
-- BLOCKER or MAJOR → NEEDS CHANGES ❌
-- Cannot tell → NEEDS CLARIFICATION ❓"
-
-if (( NOISE_FILTERED )); then
-  PR_TITLE_FOR_PROMPT="[redacted — references filtered files; review the diff]"
-  PR_BODY_FOR_PROMPT="[redacted — references filtered files; review the diff]"
-else
-  PR_TITLE_FOR_PROMPT="$PR_TITLE"
-  PR_BODY_FOR_PROMPT="$PR_BODY"
-fi
-
-USER_PROMPT="$MODE_NOTE
-
-PR metadata:
-- Repo: $FULL_REPO
-- Number: $PR_NUMBER
-- Title: $PR_TITLE_FOR_PROMPT
-- Author: @$PR_AUTHOR
-- Stats: +$PR_ADD / -$PR_DEL across $PR_CHANGED files
-- HEAD: $HEAD_SHA
-- Base: $PR_BASE ($DIFF_BASE)
-
-## PR description
-$PR_BODY_FOR_PROMPT
-
-## Changed files
-$CHANGED_FILES
-
-NOTE: Lockfiles, binaries, migrations, etc. are filtered as noise and not shown. PR title/description may reference excluded files — review only what is shown below. The diff is the source of truth.
-
-## Diff (unified, U${HUNK_CONTEXT_LINES} context)${DIFF_TRUNCATED_NOTE}
-
-Each added line is prefixed with \`file:line\` for citation. Use these exact line numbers in findings — do not recompute from hunk headers.
-
-\`\`\`diff
-$DIFF
-\`\`\`
-$COMMITS_SECTION
-
-$CALLERS_SECTION
-
-## Prior reviews
-$REVIEWS
-
-## Prior inline review comments
-$INLINE_COMMENTS
-
-## Prior issue comments
-$ISSUE_COMMENTS
-
-## Active review threads (unresolved, non-outdated)
-$REVIEW_THREADS_ACTIVE
-
----
-
-Output the review markdown matching EXACTLY this template (replace angle-bracket placeholders, keep all section headers verbatim, end on the **Conclusion:** line — no footer, no horizontal rule, no date, no model name):
-
-$TEMPLATE"
+build_prompts \
+  "$INCREMENTAL" "$NOISE_FILTERED" "$PRIOR_REVIEW_SHA" \
+  "$HEAD_SHA" "$PR_TITLE" "$PR_TITLE_HEADER" "$PR_BODY" \
+  "$FULL_REPO" "$PR_NUMBER" "$PR_AUTHOR" \
+  "$PR_ADD" "$PR_DEL" "$PR_CHANGED" \
+  "$PR_BASE" "$DIFF_BASE" \
+  "$DIFF" "$DIFF_TRUNCATED_NOTE" "$ALIAS_LIST" \
+  "$COMMITS_SINCE" "$CALLERS_SECTION" \
+  "$REVIEWS" "$INLINE_COMMENTS" "$ISSUE_COMMENTS" "$REVIEW_THREADS_ACTIVE"
 
 # --- Call llama-server ---
 echo "Calling llama-server (model=$LLAMA_MODEL, prompt bytes=${#USER_PROMPT})..."
 
-# --- Pre-flight: count prompt tokens, enforce ctx budget ---
-TOK_JSON="$(jq -n --arg c "$SYSTEM_PROMPT"$'\n'"$USER_PROMPT" '{content: $c}')"
-TOK_RESP="$(curl -s -X POST "$LLAMA_URL/tokenize" \
-  -H 'content-type: application/json' \
-  -d "$TOK_JSON")"
-PROMPT_TOKENS="$(jq -r '.tokens | length' <<<"$TOK_RESP" 2>/dev/null || echo "")"
+preflight_token_count "$SYSTEM_PROMPT" "$USER_PROMPT"
+enforce_ctx_budget
+stream_chat_completion "$SYSTEM_PROMPT" "$USER_PROMPT"
+validate_review_output
 
-if [[ -z "$PROMPT_TOKENS" || "$PROMPT_TOKENS" == "null" ]]; then
-  # Fallback estimate: 1 token ≈ 4 chars.
-  PROMPT_TOKENS=$(( (${#SYSTEM_PROMPT} + ${#USER_PROMPT}) / 4 ))
-  echo "warn: /tokenize unavailable, estimated prompt_tokens≈$PROMPT_TOKENS" >&2
-fi
+# Restore real filenames from F1/F2/... aliases.
+REVIEW_MD="$(restore_aliases "$REVIEW_MD")"
 
-BUDGET_LIMIT=$(( CTX_SIZE - CTX_SAFETY_MARGIN ))
-NEEDED=$(( PROMPT_TOKENS + MAX_TOKENS ))
-echo "tokens: prompt=$PROMPT_TOKENS max_output=$MAX_TOKENS ctx=$CTX_SIZE (margin=$CTX_SAFETY_MARGIN)"
-
-if (( NEEDED > BUDGET_LIMIT )); then
-  echo "ERROR: prompt($PROMPT_TOKENS) + MAX_TOKENS($MAX_TOKENS) = $NEEDED exceeds ctx budget $BUDGET_LIMIT." >&2
-  echo "Options: shrink diff (HUNK_CONTEXT_LINES, MAX_SYMBOLS), lower MAX_TOKENS, or raise CTX_SIZE/server -c." >&2
-  exit 5
-fi
-
-REQ_JSON="$(jq -n \
-  --arg model "$LLAMA_MODEL" \
-  --arg sys "$SYSTEM_PROMPT" \
-  --arg user "$USER_PROMPT" \
-  --argjson max_tokens "$MAX_TOKENS" \
-  '{
-    model: $model,
-    messages: [
-      { role: "system", content: $sys },
-      { role: "user", content: $user }
-    ],
-    temperature: 0.2,
-    top_p: 0.9,
-    max_tokens: $max_tokens,
-    stream: true,
-    stream_options: { include_usage: true }
-  }'
-)"
-
-STREAM_FILE="$LOCK_DIR/last-stream.sse"
-REASONING_FILE="$LOCK_DIR/last-reasoning.txt"
-CONTENT_FILE="$LOCK_DIR/last-content.txt"
-: > "$STREAM_FILE"
-: > "$REASONING_FILE"
-: > "$CONTENT_FILE"
-
-# stream SSE, split deltas into reasoning + content files in real-time
-curl -sN -X POST "$LLAMA_URL/v1/chat/completions" \
-  -H 'content-type: application/json' \
-  -d "$REQ_JSON" 2>/dev/null \
-  | tee "$STREAM_FILE" \
-  | while IFS= read -r line; do
-      [[ "$line" == "data: "* ]] || continue
-      payload="${line#data: }"
-      [[ "$payload" == "[DONE]" ]] && continue
-      jq -rj '.choices[0].delta.content // ""' <<<"$payload" 2>/dev/null >> "$CONTENT_FILE"
-      jq -rj '.choices[0].delta.reasoning_content // ""' <<<"$payload" 2>/dev/null >> "$REASONING_FILE"
-    done
-
-REVIEW_MD="$(cat "$CONTENT_FILE")"
-REVIEW_MD="$(printf '%s' "$REVIEW_MD" | perl -0777 -pe 's|<think>.*?</think>\s*||gs')"
-REASONING="$(cat "$REASONING_FILE")"
-USAGE="$(grep '^data: ' "$STREAM_FILE" | sed 's/^data: //' | jq -rs 'map(select(.usage)) | last | .usage // {} | "prompt=\(.prompt_tokens // "?") completion=\(.completion_tokens // "?") total=\(.total_tokens // "?")"' 2>/dev/null || true)"
-[[ -n "$USAGE" ]] && echo "usage: $USAGE"
-FINISH_REASON="$(grep '^data: ' "$STREAM_FILE" | sed 's/^data: //' | jq -rs 'map(.choices[0].finish_reason // empty) | last // ""' 2>/dev/null || true)"
-
-if [[ -z "$REVIEW_MD" || ! "$REVIEW_MD" =~ "Conclusion:" ]]; then
-  echo "ERROR: model output missing Conclusion line. finish_reason=$FINISH_REASON, content_len=${#REVIEW_MD}, reasoning_len=${#REASONING}" >&2
-  if [[ "$FINISH_REASON" == "length" && -z "$REVIEW_MD" && -n "$REASONING" ]]; then
-    echo "Hint: thinking budget exhausted before answer. Raise MAX_TOKENS (current=$MAX_TOKENS) or shrink prompt." >&2
-  fi
-  echo "---response head---" >&2
-  printf '%s' "$RESP" | head -c 2000 >&2
-  echo >&2
-  exit 4
-fi
+# Belt-and-braces: strip any line-number citations the model leaked despite
+# the "no line numbers" rule. Targets common phrasings: "line 1234",
+# "at line 1234", "(line 1234)", trailing ":1234" after filenames/symbols.
+REVIEW_MD="$(printf '%s' "$REVIEW_MD" | perl -pe '
+  s/\s*\(\s*(?:at\s+)?line\s+\d+\s*\)//gi;
+  s/\s*(?:at\s+)?\bline\s+\d+\b//gi;
+  s/(?<=\w):\d+\b//g;
+')"
 
 # --- Post review ---
 echo "$REVIEW_MD" > pr-review.md
 
-CONCLUSION_LINE="$(grep -E '\*\*Conclusion:\*\*' pr-review.md | head -1 || true)"
+CONCLUSION_LINE="$(grep -E '(^|\s)(\*\*)?Conclusion:(\*\*)?' pr-review.md | head -1 || true)"
 IS_APPROVED=0
 NEEDS_ACTION=0
 if echo "$CONCLUSION_LINE" | grep -qE 'APPROVED'; then

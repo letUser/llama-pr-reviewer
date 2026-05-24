@@ -17,6 +17,17 @@ bin/review-pr      → fetches diff + context, calls llama-server, posts review,
                      erases llama-server slot 0 on exit to free VRAM
 ```
 
+`bin/review-pr` is an orchestrator. Heavy lifting lives in `lib/`:
+
+| File | Responsibility |
+|------|----------------|
+| [`lib/config.sh`](lib/config.sh) | `.env` loading, budget defaults, `NOISE_PATHSPECS`, GNU `date` detection |
+| [`lib/triage.sh`](lib/triage.sh) | Noise / dep-manifest / whitespace-only classification, auto-approve skip path |
+| [`lib/diff.sh`](lib/diff.sh) | Diff stripping, file-alias (`F1`/`F2`/…) build & apply & restore, changed-symbol + caller extraction |
+| [`lib/github.sh`](lib/github.sh) | Prior reviews / inline / issue comments + GraphQL active review threads |
+| [`lib/prompt.sh`](lib/prompt.sh) | `SYSTEM_PROMPT`, review templates, `USER_PROMPT` assembly |
+| [`lib/llama.sh`](lib/llama.sh) | `/tokenize` preflight, ctx budget enforcement, SSE streaming, output validation, VRAM cleanup |
+
 ### Worker exit codes (`bin/review-pr`)
 
 | Code | Meaning |
@@ -164,6 +175,13 @@ answer — exit 4. Three llama-server flags address this:
   penalizes repeated n-grams. Helps small reasoning models that loop on
   "Wait, ..." / "Let me check ..." inside the CoT. `allowed-length 4` is safe
   for code (avoids hurting short syntactic repeats like `})`).
+- `--repeat-penalty 1.1 --repeat-last-n 256` — classic n-gram repeat penalty
+  over a wider window. Catches paragraph-level loops that DRY misses (e.g. the
+  same "Wait, one more check:" block re-emitted every ~150 tokens). The
+  256-token window is large enough to span a typical loop period without
+  hurting legitimate cross-section repeats (filenames cited in two sections,
+  section headers). `1.1` is gentle — `1.2+` starts distorting verbatim
+  template adherence.
 
 If your llama-server build lacks `--reasoning-budget`, fall back to oversizing
 `MAX_TOKENS` (e.g. `49152`) and accept longer review wall time.
@@ -179,7 +197,9 @@ llama-server flags:
 --reasoning-budget 8000 \
 --dry-multiplier 0.8 \
 --dry-base 1.75 \
---dry-allowed-length 4
+--dry-allowed-length 4 \
+--repeat-penalty 1.1 \
+--repeat-last-n 256
 ```
 
 With a 9B-class Q4 model and partial offload (`-ngl 24`) this lands around
@@ -210,15 +230,20 @@ Prompt budget: ~48 K tokens ≈ ~130 KB, ~800–1500 changed lines.
 ## What the reviewer optimizes for
 
 - **Triage gate**: lockfiles, binaries, minified, whitespace-only, dependency-only PRs auto-approved without calling the model.
-- **Noise filter**: lockfiles, binaries, snapshots, fonts, migrations (`**/migrations/*.{js,ts,sql}`), and CHANGELOGs are excluded from the diff sent to the model. When any file is filtered, the PR title and description are also redacted in the prompt (they often reference excluded files, which would otherwise spiral the model into "the diff doesn't match the title" loops).
-- **Diff line annotation**: every added line is pre-prefixed `+file:line| …` before being sent. Lets the model cite `file:line` in findings without re-computing offsets from hunk headers.
+- **Noise filter**: lockfiles, binaries, snapshots, fonts, and CHANGELOGs are excluded from the diff sent to the model. Pathspec list lives in `NOISE_PATHSPECS` in [`lib/config.sh`](lib/config.sh) — edit there to add/remove patterns. When any file is filtered, the PR title and description are also redacted in the prompt (they often reference excluded files, which would otherwise spiral the model into "the diff doesn't match the title" loops).
+- **File-alias substitution**: every changed file path is replaced with a short alias (`F1`, `F2`, …) in the diff and caller-hits sections sent to the model. Small reasoning models fragment long compound paths (digit runs in migration timestamps, CamelCase filenames) and spiral on re-reading them — short stable aliases dodge the tokenizer issue. After the model emits its review (citing `F1`/`F2`), the worker post-processes `REVIEW_MD` to restore real paths. Findings cite by alias only — no line numbers — and a belt-and-braces `perl` strip removes any `line 1234` / `(line 35)` / trailing `:1234` the model might leak.
 - **PR title sanitization**: brackets and parens are stripped before injecting the title (`[OGENG-1234]` → `OGENG-1234`). Stops tokenizer-attention spirals on bracketed Jira IDs.
 - **Tight prompt**: configurable diff context, changed-symbol extraction + git grep caller hits, compact one-line comment summaries.
 - **No prior-self echo**: the bot's own past comments (plus `SKIP_PRIOR_AUTHORS` + `VERIFY_BOT`) are filtered out so it never restates itself across re-reviews.
 - **Active threads only**: unresolved, non-outdated review threads pulled via GraphQL — resolved/outdated ones ignored.
 - **Incremental mode**: prior reviewed SHA inferred from the bot's last comment timestamp; only the new range is reviewed.
 - **Streaming with newline-safe parser**: SSE deltas are appended directly to `$PR_REVIEWER_HOME/.cache/last-content.txt` and `last-reasoning.txt` (bash `$(...)` strips trailing newlines, which would flatten the review's markdown — the worker uses pipe-to-file instead). Tail those files to watch generation live.
-- **Strict template**: model output forced into a known shape; conclusion line drives auto-approve (only fires when `APPROVED` present and `NEEDS` absent).
+- **Strict template + relaxed conclusion regex**: model output forced into a known shape; auto-approve grep matches both `**Conclusion:**` and plain `Conclusion:` (small reasoning models sometimes drop the markdown bold) and triggers when `APPROVED` is present and `NEEDS` absent.
+- **Anti-loop prompt + sampler**: SYSTEM_PROMPT tells the model to commit fast — one pass through the diff, no re-walking, no re-quoting constraints, no template re-verification. Paired with llama-server `--repeat-penalty 1.1 --repeat-last-n 256` to catch paragraph-level "Wait, one more check:" loops.
+- **Trust-first-read clamp**: small reasoning models suffer tokenizer fragmentation on re-reads of the diff — same line looks different each pass, hallucinating missing `this.`, trailing commas, broken brackets, or identifier mismatches. SYSTEM_PROMPT explicitly forbids flagging any syntax-level concern found on a re-read: "the actual code compiles; trust your first read." Prevents the worst failure mode (false-positive MAJOR findings that flip APPROVED → NEEDS CHANGES based on phantom bugs).
+- **Stray `</think>` strip**: when the model leaks chain-of-thought into the `content` channel without an opening `<think>` tag (closing tag only), the worker drops everything up to and including the closing tag before posting.
+- **Conclusion emoji normalization**: small reasoning models often drop the U+FE0F variation selector on `⚠️`, emitting a bare U+26A0. The worker post-processes `REVIEW_MD` to re-attach VS16 so the GitHub comment renders consistently. `✅` `❌` `❓` are single codepoints and unaffected.
+- **File-based JSON / curl bodies**: prompts > ~128 KB blow past `ARG_MAX` when passed via `jq --arg` or `curl -d`. The worker writes system/user prompts to temp files in `.cache/` and uses `jq --rawfile` + `curl --data-binary @file` so large PRs don't trip the kernel limit.
 - **VRAM hygiene**: each worker run erases llama-server slot 0 on exit; optional full `LLAMA_UNIT` restart between batches via `RESTART_LLAMA=1`.
 
 ## Debugging
@@ -261,6 +286,14 @@ When `NOTIFY_TARGET` + `NOTIFY_CHANNEL` are set, two messages per run are sent v
 
 1. **Queue start** (from `bin/scan-open-prs`): list of queued `repo#pr` items.
 2. **Queue done** (from `bin/review-queue`): per-PR outcome line with emoji — ✅ approved, ⚠️ approved with caution, ❌ needs changes, ❓ needs clarification, 💬 commented, ⏭ skipped (already reviewed / author skipped), 🔥 worker failure — plus the PR URL.
+
+## Limitations
+
+Tested mostly against a 9B-class Q4 reasoning model (`Qwen3.5-9B-Q4_K_M`). Output quality and behavior scale with model size and quality. Specific known issues:
+
+- **PR size ceiling**: for diffs above ~2K LOC the prompt approaches the 64K-128K context budget, and small reasoning models burn the `--reasoning-budget` on filename / identifier fragmentation loops before emitting the review. Practical cap around 1.5K–2K changed LOC; very large refactors will need manual review (or per-file chunking — not implemented yet).
+- **Tokenizer-induced spiral**: the model sometimes re-reads the diff and "sees" hallucinated typos (missing `this.`, stray commas, broken brackets). The trust-first-read clamp in SYSTEM_PROMPT suppresses these as findings, but the wasted reasoning tokens still count against `MAX_TOKENS` and slow wall-clock time.
+- **Citation precision**: findings cite by filename only (no line numbers). Restoring exact paths is reliable via the F1/F2 alias system; line numbers are dropped because small models can't read hunk offsets without recomputing them and getting them wrong.
 
 ## License
 

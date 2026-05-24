@@ -5,6 +5,7 @@
 .share/order-grid-back
 .share/order-grid-app
 .share/order-grid-mobile-app
+.cache/last-*
 
 # Backups / scratch
 *.bak
