@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="${PR_REVIEWER_HOME:-$SCRIPT_DIR}"
+CONFIG="$DATA_DIR/.env"
+if [[ -f "$CONFIG" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG"
+fi
+
+QUEUE_DIR="$DATA_DIR/.cache"
+QUEUE_FILE="$QUEUE_DIR/queue.tsv"
+LOCK_FILE="$QUEUE_DIR/queue.lock"
+WORKER="${WORKER:-$SCRIPT_DIR/pr-review-one}"
+OWNER="${OWNER:?OWNER env var required (GitHub org/user that owns the repo). Set in $CONFIG or export OWNER=...}"
+NOTIFY_TARGET="${NOTIFY_TARGET:-}"
+NOTIFY_CHANNEL="${NOTIFY_CHANNEL:-}"
+
+notify() {
+  local msg="$1"
+  [[ -z "$NOTIFY_TARGET" || -z "$NOTIFY_CHANNEL" ]] && return 0
+  bash -lc "
+    source \"\$HOME/.nvm/nvm.sh\" >/dev/null 2>&1 && nvm use 22 >/dev/null 2>&1
+    openclaw message send --channel '$NOTIFY_CHANNEL' --target '$NOTIFY_TARGET' --message \"\$1\" >/dev/null 2>&1
+  " _ "$msg" || true
+}
+
+pr_status() {
+  local repo="$1" pr_number="$2" login review_state body
+  login="$(gh api user --jq .login 2>/dev/null || echo '')"
+
+  review_state="$(gh pr view "$pr_number" --repo "$OWNER/$repo" \
+    --json reviews \
+    --jq ".reviews | map(select(.author.login == \"$login\")) | last | .state // \"NONE\"" \
+    2>/dev/null || echo 'UNKNOWN')"
+
+  if [[ "$review_state" == "APPROVED" || "$review_state" == "CHANGES_REQUESTED" ]]; then
+    echo "$review_state"
+    return
+  fi
+
+  body="$(gh api "repos/$OWNER/$repo/issues/$pr_number/comments" --paginate \
+    --jq "[.[] | select(.user.login == \"$login\")] | last | .body // \"\"" \
+    2>/dev/null || echo '')"
+
+  case "$body" in
+    *"Conclusion:"*"NEEDS CHANGES"*)      echo "CHANGES_REQUESTED" ;;
+    *"Conclusion:"*"NEEDS CLARIFICATION"*) echo "NEEDS_CLARIFICATION" ;;
+    *"Conclusion:"*"APPROVED WITH CAUTION"*) echo "APPROVED_WITH_CAUTION" ;;
+    *"Conclusion:"*"APPROVED"*)           echo "APPROVED" ;;
+    *)                                    echo "$review_state" ;;
+  esac
+}
+
+mkdir -p "$QUEUE_DIR"
+
+exec 9>"$LOCK_FILE"
+
+echo "Waiting for PR review queue lock..."
+flock 9
+echo "Acquired PR review queue lock."
+
+if [[ ! -s "$QUEUE_FILE" ]]; then
+  echo "Queue is empty."
+  exit 0
+fi
+
+declare -a results=()
+
+while IFS=$'\t' read -r repo pr_number; do
+  [[ -z "${repo:-}" || -z "${pr_number:-}" ]] && continue
+
+  echo "Starting queued PR review: $repo #$pr_number"
+
+  set +e
+  "$WORKER" "$repo" "$pr_number"
+  worker_rc=$?
+  set -e
+
+  case "$worker_rc" in
+    0)
+      echo "Finished queued PR review: $repo #$pr_number"
+      decision="$(pr_status "$repo" "$pr_number")"
+      case "$decision" in
+        APPROVED)              emoji="✅"; verb="approved" ;;
+        APPROVED_WITH_CAUTION) emoji="⚠️"; verb="approved with caution" ;;
+        CHANGES_REQUESTED)     emoji="❌"; verb="needs changes" ;;
+        NEEDS_CLARIFICATION)   emoji="❓"; verb="needs clarification" ;;
+        COMMENTED)             emoji="💬"; verb="commented" ;;
+        *)                     emoji="❔"; verb="reviewed ($decision)" ;;
+      esac
+      line="${emoji} ${repo}#${pr_number} — ${verb} — https://github.com/${OWNER}/${repo}/pull/${pr_number}"
+      ;;
+    100)
+      echo "Skipped (already reviewed at HEAD): $repo #$pr_number"
+      line="⏭ ${repo}#${pr_number} — already reviewed — https://github.com/${OWNER}/${repo}/pull/${pr_number}"
+      ;;
+    101)
+      echo "Skipped (author in SKIP_AUTHORS): $repo #$pr_number"
+      line="⏭ ${repo}#${pr_number} — author skipped — https://github.com/${OWNER}/${repo}/pull/${pr_number}"
+      ;;
+    *)
+      echo "Failed queued PR review: $repo #$pr_number (rc=$worker_rc)"
+      line="🔥 ${repo}#${pr_number} — worker failed (rc=$worker_rc) — https://github.com/${OWNER}/${repo}/pull/${pr_number}"
+      ;;
+  esac
+  results+=("$line")
+
+  echo "---"
+done < "$QUEUE_FILE"
+
+rm -f "$QUEUE_FILE"
+
+echo "Queue completed."
+
+RESTART_LLAMA="${RESTART_LLAMA:-0}"
+if [[ "$RESTART_LLAMA" == "1" || "$RESTART_LLAMA" == "true" ]]; then
+  LLAMA_UNIT="${LLAMA_UNIT:?LLAMA_UNIT env var required when RESTART_LLAMA=1 (systemd --user unit name). Set in $CONFIG}"
+  LLAMA_URL="${LLAMA_URL:?LLAMA_URL env var required when RESTART_LLAMA=1. Set in $CONFIG}"
+  echo "Restarting $LLAMA_UNIT to free VRAM..."
+  systemctl --user restart "$LLAMA_UNIT" 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    if curl -sf "$LLAMA_URL/health" >/dev/null 2>&1; then
+      echo "llama-server back online."
+      break
+    fi
+    sleep 1
+  done
+else
+  echo "Skipping llama-server restart (set RESTART_LLAMA=1 to enable)."
+fi
+
+summary=$'🌿 PR review queue done.\n'
+for r in "${results[@]}"; do
+  summary+="$r"$'\n'
+done
+notify "$summary"

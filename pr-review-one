@@ -1,0 +1,624 @@
+#!/usr/bin/env bash
+# Scripted PR reviewer: pre-fetches all data, asks the local LLM for a single
+# review markdown, posts it via gh. No agent loop, no tool calls.
+#
+# Optimization pass:
+#   - Triage gate (lockfile/whitespace/empty/binary-only → skip model)
+#   - Tight byte budget tuned for Q4 ~12k useful tokens
+#   - Diff with -U20 context replaces full-file inlining
+#   - Changed-symbol extraction + git grep caller hits
+#   - Compact one-line comments instead of raw JSON
+#   - Diff noise stripping, resolved-thread filtering
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="${PR_REVIEWER_HOME:-$SCRIPT_DIR}"
+CONFIG="$DATA_DIR/.env"
+if [[ -f "$CONFIG" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG"
+fi
+
+LOCK_DIR="$DATA_DIR/.cache"
+LOCK_FILE="$LOCK_DIR/review.lock"
+
+mkdir -p "$LOCK_DIR"
+exec 9>"$LOCK_FILE"
+
+echo "Waiting for PR review queue lock..."
+flock 9
+echo "Acquired PR review queue lock. Starting review..."
+
+REPO="${1:?repo name required}"
+PR_NUMBER="${2:?PR number required}"
+
+OWNER="${OWNER:?OWNER env var required (GitHub org/user that owns the repo). Set in $DATA_DIR/.config/config or export OWNER=...}"
+WORKSPACE_BASE="${WORKSPACE_BASE:-$DATA_DIR/.share}"
+FULL_REPO="$OWNER/$REPO"
+REPO_DIR="$WORKSPACE_BASE/$REPO"
+
+LLAMA_URL="${LLAMA_URL:?LLAMA_URL env var required (e.g. http://127.0.0.1:8082). Set in $CONFIG}"
+LLAMA_MODEL="${LLAMA_MODEL:?LLAMA_MODEL env var required (model name served by llama-server). Set in $CONFIG}"
+
+# Locate a GNU-compatible date (BSD/macOS `date` lacks `-d`).
+if date -d @0 +%s >/dev/null 2>&1; then
+  DATE_CMD=date
+elif command -v gdate >/dev/null 2>&1 && gdate -d @0 +%s >/dev/null 2>&1; then
+  DATE_CMD=gdate
+else
+  echo "ERROR: GNU date required. On macOS: brew install coreutils." >&2
+  exit 1
+fi
+
+# Budget — tuned for ~12k useful tokens
+MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-120000}"
+MAX_PR_BODY_BYTES="${MAX_PR_BODY_BYTES:-1500}"
+HUNK_CONTEXT_LINES="${HUNK_CONTEXT_LINES:-20}"
+MAX_SYMBOLS="${MAX_SYMBOLS:-15}"
+MAX_CALLERS_PER_SYMBOL="${MAX_CALLERS_PER_SYMBOL:-3}"
+MAX_COMMENT_BODY="${MAX_COMMENT_BODY:-200}"
+
+# thinking mode eats tokens before answer. Give big budget.
+MAX_TOKENS="${MAX_TOKENS:-8192}"
+
+# Cap title length used in markdown header (avoid huge h1 lines).
+MAX_TITLE_LEN="${MAX_TITLE_LEN:-60}"
+
+# Tag a verifier bot at end of review. Set VERIFY_BOT=<login> (no @).
+# Unset = no mention appended.
+VERIFY_BOT="${VERIFY_BOT:-}"
+if [[ -n "$VERIFY_BOT" ]]; then
+  VERIFY_MENTION="@$VERIFY_BOT review"
+else
+  VERIFY_MENTION=""
+fi
+
+# Comma-separated bot logins to exclude when fetching prior comments/reviews
+# (avoid feeding our own past reviews back into the model as "prior findings").
+# Unset = skip nothing. VERIFY_BOT (if set) auto-added below.
+SKIP_PRIOR_AUTHORS="${SKIP_PRIOR_AUTHORS:-}"
+if [[ -n "$VERIFY_BOT" ]]; then
+  SKIP_PRIOR_AUTHORS="${SKIP_PRIOR_AUTHORS:+$SKIP_PRIOR_AUTHORS,}$VERIFY_BOT,${VERIFY_BOT}[bot]"
+fi
+
+# Pathspecs excluded from the diff sent to the model. Triage gate already
+# auto-skips all-noise PRs; these patterns drop noise hunks from mixed PRs so
+# the model never reviews lockfiles, binaries, minified bundles, etc.
+NOISE_PATHSPECS=(
+  ':(exclude,glob)**/*.lock'
+  ':(exclude,glob)**/*.lockb'
+  ':(exclude,glob)**/package-lock.json'
+  ':(exclude,glob)**/yarn.lock'
+  ':(exclude,glob)**/pnpm-lock.yaml'
+  ':(exclude,glob)**/Cargo.lock'
+  ':(exclude,glob)**/Gemfile.lock'
+  ':(exclude,glob)**/poetry.lock'
+  ':(exclude,glob)**/Pipfile.lock'
+  ':(exclude,glob)**/composer.lock'
+  ':(exclude,glob)**/*.min.js'
+  ':(exclude,glob)**/*.min.css'
+  ':(exclude,glob)**/*.map'
+  ':(exclude,glob)**/*.svg'
+  ':(exclude,glob)**/*.png'
+  ':(exclude,glob)**/*.jpg'
+  ':(exclude,glob)**/*.jpeg'
+  ':(exclude,glob)**/*.gif'
+  ':(exclude,glob)**/*.ico'
+  ':(exclude,glob)**/*.pdf'
+  ':(exclude,glob)**/*.bin'
+  ':(exclude,glob)**/*.woff'
+  ':(exclude,glob)**/*.woff2'
+  ':(exclude,glob)**/*.ttf'
+  ':(exclude,glob)**/*.eot'
+  ':(exclude,glob)**/*.snap'
+  ':(exclude,glob)**/*.snapshot'
+  ':(exclude,glob)**/CHANGELOG.md'
+  ':(exclude,glob)**/CHANGELOG'
+)
+
+# Comma-separated GitHub logins whose PRs we skip entirely. Unset = skip none.
+SKIP_AUTHORS="${SKIP_AUTHORS:-}"
+
+cleanup_vram() {
+  curl -s -X POST "$LLAMA_URL/slots/0?action=erase" >/dev/null 2>&1 \
+    && echo "Cleared llama-server slot 0." \
+    || echo "WARNING: failed to erase llama-server slot 0."
+}
+trap cleanup_vram EXIT
+
+mkdir -p "$WORKSPACE_BASE"
+if [[ ! -d "$REPO_DIR/.git" ]]; then
+  gh repo clone "$FULL_REPO" "$REPO_DIR"
+fi
+cd "$REPO_DIR"
+
+git fetch --all --prune
+gh pr checkout "$PR_NUMBER" --repo "$FULL_REPO" --force
+
+LOGIN="$(gh api user --jq .login 2>/dev/null || echo '')"
+
+# JSON array of all logins whose prior comments/reviews must be excluded from the
+# context fed to the model (self + configured bots). Embedded literally into jq
+# expressions below.
+SKIP_LOGINS_JQ="$(
+  printf '%s\n' "$LOGIN" $(echo "$SKIP_PRIOR_AUTHORS" | tr ',' ' ') \
+    | awk 'NF' \
+    | jq -R . \
+    | jq -sc 'unique'
+)"
+
+HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || echo '')"
+HEAD_COMMIT_AT="$(git log -1 --format=%cI "$HEAD_SHA" 2>/dev/null || echo '')"
+
+# Latest own issue comment timestamp (for skip + incremental inference).
+LAST_OWN_COMMENT_AT=""
+if [[ -n "$LOGIN" ]]; then
+  LAST_OWN_COMMENT_AT="$(
+    gh api "repos/$FULL_REPO/issues/$PR_NUMBER/comments" --paginate \
+      --jq "[.[] | select(.user.login == \"$LOGIN\")] | last | .created_at // \"\"" \
+      2>/dev/null || true
+  )"
+fi
+
+# Skip if we already reviewed this exact HEAD.
+if [[ -n "$LAST_OWN_COMMENT_AT" && -n "$HEAD_COMMIT_AT" ]]; then
+  comment_epoch="$("$DATE_CMD" -u -d "$LAST_OWN_COMMENT_AT" +%s 2>/dev/null || echo 0)"
+  head_epoch="$("$DATE_CMD" -u -d "$HEAD_COMMIT_AT" +%s 2>/dev/null || echo 0)"
+  if (( comment_epoch > head_epoch )); then
+    echo "Already reviewed PR #$PR_NUMBER at HEAD $HEAD_SHA. Skipping."
+    exit 100
+  fi
+fi
+
+# Detect incremental mode by inferring prior reviewed SHA from last comment time.
+PRIOR_REVIEW_SHA=""
+INCREMENTAL=0
+if [[ -n "$LAST_OWN_COMMENT_AT" ]]; then
+  inferred="$(git log --before="$LAST_OWN_COMMENT_AT" -1 --format=%H "$HEAD_SHA" 2>/dev/null || true)"
+  if [[ -n "$inferred" && "$inferred" != "$HEAD_SHA" ]]; then
+    PRIOR_REVIEW_SHA="$inferred"
+    INCREMENTAL=1
+    echo "Incremental review: prior reviewed SHA inferred as $PRIOR_REVIEW_SHA, current HEAD $HEAD_SHA."
+  fi
+fi
+
+# --- Fetch PR data ---
+echo "Fetching PR data for #$PR_NUMBER..."
+
+PR_JSON="$(gh pr view "$PR_NUMBER" --repo "$FULL_REPO" \
+  --json number,title,body,baseRefName,headRefName,state,additions,deletions,changedFiles,author \
+  --jq '.')"
+PR_TITLE="$(jq -r '.title' <<<"$PR_JSON")"
+if (( ${#PR_TITLE} > MAX_TITLE_LEN )); then
+  PR_TITLE_HEADER="${PR_TITLE:0:$MAX_TITLE_LEN}..."
+else
+  PR_TITLE_HEADER="$PR_TITLE"
+fi
+PR_BODY_FULL="$(jq -r '.body // ""' <<<"$PR_JSON")"
+PR_BODY="${PR_BODY_FULL:0:$MAX_PR_BODY_BYTES}"
+PR_AUTHOR="$(jq -r '.author.login // .author.name // "unknown"' <<<"$PR_JSON")"
+
+# Skip PRs from configured authors (e.g. self-authored PRs).
+IFS=',' read -ra _skip_authors <<<"$SKIP_AUTHORS"
+for _a in "${_skip_authors[@]}"; do
+  _a="${_a// /}"
+  [[ -z "$_a" ]] && continue
+  if [[ "$PR_AUTHOR" == "$_a" ]]; then
+    echo "Skipping PR #$PR_NUMBER: author @$PR_AUTHOR in SKIP_AUTHORS."
+    exit 101
+  fi
+done
+
+PR_BASE="$(jq -r '.baseRefName' <<<"$PR_JSON")"
+PR_ADD="$(jq -r '.additions' <<<"$PR_JSON")"
+PR_DEL="$(jq -r '.deletions' <<<"$PR_JSON")"
+PR_CHANGED="$(jq -r '.changedFiles' <<<"$PR_JSON")"
+
+# Determine diff range.
+if (( INCREMENTAL )); then
+  DIFF_BASE="$PRIOR_REVIEW_SHA"
+  COMMITS_SINCE="$(git log --oneline "$PRIOR_REVIEW_SHA..$HEAD_SHA" || true)"
+else
+  DIFF_BASE="$(git merge-base "origin/$PR_BASE" "$HEAD_SHA" 2>/dev/null || echo "origin/$PR_BASE")"
+  COMMITS_SINCE=""
+fi
+
+# Diff with wider context (U20). Strip noise lines.
+strip_diff_noise() {
+  sed -E \
+    -e '/^index [0-9a-f]+\.\.[0-9a-f]+/d' \
+    -e '/^similarity index /d' \
+    -e '/^dissimilarity index /d' \
+    -e '/^rename from /d' \
+    -e '/^rename to /d' \
+    -e '/^new file mode /d' \
+    -e '/^deleted file mode /d' \
+    -e '/^old mode /d' \
+    -e '/^new mode /d' \
+    -e '/^Binary files .* differ$/d'
+}
+
+# Raw (unfiltered) diff + file list — used only for the triage gate so that
+# all-noise PRs still get auto-skipped. The filtered versions sent to the model
+# are computed after the triage gate.
+DIFF_RAW_FULL="$(git diff "-U${HUNK_CONTEXT_LINES}" "$DIFF_BASE..$HEAD_SHA" | strip_diff_noise || true)"
+CHANGED_FILES_ALL="$(git diff --name-only "$DIFF_BASE..$HEAD_SHA" 2>/dev/null || true)"
+
+# --- Triage gate: skip model entirely on trivial diffs ---
+is_noise_path() {
+  case "$1" in
+    *.lock|*.lockb|*package-lock.json|*yarn.lock|*pnpm-lock.yaml|*Cargo.lock|*Gemfile.lock|*poetry.lock|*Pipfile.lock|*composer.lock) return 0 ;;
+    *.min.js|*.min.css|*.map) return 0 ;;
+    *.svg|*.png|*.jpg|*.jpeg|*.gif|*.ico|*.pdf|*.bin|*.woff|*.woff2|*.ttf|*.eot) return 0 ;;
+    *.snap|*.snapshot) return 0 ;;
+    *)
+      case "$(basename "$1")" in
+        CHANGELOG.md|CHANGELOG) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+  esac
+}
+
+# Dep manifests: meaningful files that, when changed alongside only lockfiles,
+# still represent a dep-only PR (no application logic).
+is_dep_manifest() {
+  case "$(basename "$1")" in
+    package.json|composer.json|Gemfile|requirements.txt|Pipfile|go.mod|go.sum) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+TRIAGE_SKIP_REASON=""
+if [[ -z "$DIFF_RAW_FULL" ]]; then
+  TRIAGE_SKIP_REASON="empty diff"
+elif [[ -z "$CHANGED_FILES_ALL" ]]; then
+  TRIAGE_SKIP_REASON="no changed files"
+else
+  all_skip=1
+  has_dep_manifest=0
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    if is_dep_manifest "$f"; then
+      has_dep_manifest=1
+      continue
+    fi
+    if ! is_noise_path "$f"; then
+      all_skip=0
+      break
+    fi
+  done <<<"$CHANGED_FILES_ALL"
+  if (( all_skip == 1 )); then
+    if (( has_dep_manifest == 1 )); then
+      TRIAGE_SKIP_REASON="dependency-only update"
+    else
+      TRIAGE_SKIP_REASON="lockfile/generated/binary-only diff"
+    fi
+  else
+    # Whitespace-only check on the actual code changes.
+    WS_DIFF="$(git diff -w "$DIFF_BASE..$HEAD_SHA" 2>/dev/null || true)"
+    if [[ -z "$WS_DIFF" ]]; then
+      TRIAGE_SKIP_REASON="whitespace-only diff"
+    fi
+  fi
+fi
+
+if [[ -n "$TRIAGE_SKIP_REASON" ]]; then
+  echo "Triage skip: $TRIAGE_SKIP_REASON."
+  cat > pr-review.md <<EOF
+# PR #$PR_NUMBER Review — $PR_TITLE
+
+**Auto-skipped:** $TRIAGE_SKIP_REASON. No model review needed.
+
+**Conclusion:** APPROVED ✅
+EOF
+  gh pr comment "$PR_NUMBER" --repo "$FULL_REPO" --body-file pr-review.md
+  gh pr review "$PR_NUMBER" --repo "$FULL_REPO" --approve \
+    --body "Auto-approved: $TRIAGE_SKIP_REASON." \
+    || echo "WARN: gh pr review --approve failed."
+  rm -f pr-review.md
+  echo "Done (triage skip)."
+  exit 0
+fi
+
+# --- Filtered diff + file list sent to model ---
+# Strip noise paths (lockfiles, binaries, minified, changelog) via pathspecs so
+# the model only ever sees real code. Truncation applied to the filtered diff.
+DIFF_RAW="$(git diff "-U${HUNK_CONTEXT_LINES}" "$DIFF_BASE..$HEAD_SHA" -- "${NOISE_PATHSPECS[@]}" | strip_diff_noise || true)"
+CHANGED_FILES="$(git diff --name-only "$DIFF_BASE..$HEAD_SHA" -- "${NOISE_PATHSPECS[@]}" 2>/dev/null || true)"
+DIFF_BYTES="${#DIFF_RAW}"
+if (( DIFF_BYTES > MAX_DIFF_BYTES )); then
+  DIFF="${DIFF_RAW:0:$MAX_DIFF_BYTES}"
+  DIFF_TRUNCATED_NOTE="
+
+[diff truncated at $MAX_DIFF_BYTES bytes; original was $DIFF_BYTES bytes]"
+else
+  DIFF="$DIFF_RAW"
+  DIFF_TRUNCATED_NOTE=""
+fi
+
+# Defensive: if every changed file was a noise path but the triage gate did not
+# fire (e.g. unusual edge case), fall back to a non-model skip.
+if [[ -z "$DIFF_RAW" || -z "$CHANGED_FILES" ]]; then
+  echo "Triage skip: all changed paths excluded by noise filter."
+  cat > pr-review.md <<EOF
+# PR #$PR_NUMBER Review — $PR_TITLE
+
+**Auto-skipped:** all changed paths excluded by noise filter. No model review needed.
+
+**Conclusion:** APPROVED ✅
+EOF
+  gh pr comment "$PR_NUMBER" --repo "$FULL_REPO" --body-file pr-review.md
+  gh pr review "$PR_NUMBER" --repo "$FULL_REPO" --approve \
+    --body "Auto-approved: noise-only diff." \
+    || echo "WARN: gh pr review --approve failed."
+  rm -f pr-review.md
+  exit 0
+fi
+
+# --- Symbol extraction + caller awareness ---
+# Pull added identifiers from `+` lines matching common decl patterns.
+# Crude regex, language-agnostic. Filters builtins/short names.
+extract_symbols() {
+  # Only added lines (skip `+++` file headers), extract decl identifiers.
+  printf '%s\n' "$DIFF" \
+    | grep -E '^\+[^+]' \
+    | sed -E 's/^\+//' \
+    | grep -oE '(function|def|class|interface|type|fn|func|struct|enum|trait|impl|module|namespace|const|let|var|public|private|protected|static)[[:space:]]+[A-Za-z_][A-Za-z0-9_]+' \
+    | sed -E 's/^[A-Za-z]+[[:space:]]+//' \
+    | awk 'length($0) >= 4' \
+    | grep -Ev '^(if|else|for|while|return|true|false|null|None|self|this|args|kwargs|data|item|value|test|init|main|String|Number|Boolean|Object|Array)$' \
+    | sort -u \
+    | head -n "$MAX_SYMBOLS"
+}
+
+CHANGED_SYMBOLS="$(extract_symbols || true)"
+
+CALLERS_SECTION=""
+if [[ -n "$CHANGED_SYMBOLS" ]]; then
+  CALLERS_SECTION="## Caller hits for changed symbols
+"
+  while IFS= read -r sym; do
+    [[ -z "$sym" ]] && continue
+    hits="$(git grep -n --fixed-strings "$sym" -- \
+              ':!*test*' ':!*spec*' ':!*__tests__*' ':!*node_modules*' ':!*dist*' ':!*build*' \
+              2>/dev/null \
+              | awk -F: -v changed="$CHANGED_FILES" '
+                  BEGIN { n=split(changed,a,"\n"); for(i=1;i<=n;i++) if(a[i]!="") c[a[i]]=1 }
+                  !($1 in c)' \
+              | head -n "$MAX_CALLERS_PER_SYMBOL" || true)"
+    if [[ -n "$hits" ]]; then
+      CALLERS_SECTION+="
+### \`$sym\`
+\`\`\`
+$hits
+\`\`\`"
+    fi
+  done <<<"$CHANGED_SYMBOLS"
+fi
+
+# --- Comments (compact one-liners, not JSON) ---
+fetch_inline_comments() {
+  gh api "repos/$FULL_REPO/pulls/$PR_NUMBER/comments" --paginate \
+    --jq "[.[] | select(($SKIP_LOGINS_JQ | index(.user.login // \"\")) == null)] \
+          | map(\"- @\(.user.login) (\(.path):\(.line // .original_line // \"?\")): \\\"\(.body | gsub(\"\\n\"; \" \") | .[0:$MAX_COMMENT_BODY])\\\"\") \
+          | .[]" 2>/dev/null || true
+}
+fetch_issue_comments() {
+  gh api "repos/$FULL_REPO/issues/$PR_NUMBER/comments" --paginate \
+    --jq "[.[] | select(($SKIP_LOGINS_JQ | index(.user.login // \"\")) == null)] \
+          | map(\"- @\(.user.login): \\\"\(.body | gsub(\"\\n\"; \" \") | .[0:$MAX_COMMENT_BODY])\\\"\") \
+          | .[]" 2>/dev/null || true
+}
+fetch_reviews() {
+  gh api "repos/$FULL_REPO/pulls/$PR_NUMBER/reviews" --paginate \
+    --jq "[.[] | select(($SKIP_LOGINS_JQ | index(.user.login // \"\")) == null)] \
+          | map(\"- @\(.user.login) [\(.state)]: \\\"\(.body // \"\" | gsub(\"\\n\"; \" \") | .[0:$MAX_COMMENT_BODY])\\\"\") \
+          | .[]" 2>/dev/null || true
+}
+
+INLINE_COMMENTS="$(fetch_inline_comments)"
+ISSUE_COMMENTS="$(fetch_issue_comments)"
+REVIEWS="$(fetch_reviews)"
+
+# Active (unresolved, non-outdated) review threads only.
+REVIEW_THREADS_ACTIVE="$(
+  gh api graphql -F owner="$OWNER" -F repo="$REPO" -F number="$PR_NUMBER" -f query='
+    query($owner:String!,$repo:String!,$number:Int!){
+      repository(owner:$owner,name:$repo){
+        pullRequest(number:$number){
+          reviewThreads(first:50){
+            nodes{ isResolved isOutdated comments(first:5){ nodes{ author{login} path line body } } }
+          }
+        }
+      }
+    }' --jq "
+      [.data.repository.pullRequest.reviewThreads.nodes[]
+       | select(.isResolved == false and .isOutdated == false)
+       | .comments.nodes[]
+       | select(($SKIP_LOGINS_JQ | index(.author.login // \"\")) == null)
+       | \"- @\(.author.login) (\(.path // \"?\"):\(.line // \"?\")): \\\"\(.body | gsub(\"\\n\"; \" \") | .[0:200])\\\"\"]
+       | .[]" 2>/dev/null || true
+)"
+
+[[ -z "$INLINE_COMMENTS" ]]        && INLINE_COMMENTS="(none)"
+[[ -z "$ISSUE_COMMENTS" ]]         && ISSUE_COMMENTS="(none)"
+[[ -z "$REVIEWS" ]]                && REVIEWS="(none)"
+[[ -z "$REVIEW_THREADS_ACTIVE" ]]  && REVIEW_THREADS_ACTIVE="(none)"
+
+# --- Build prompt ---
+TEMPLATE_FULL="# PR #$PR_NUMBER Review — $PR_TITLE_HEADER
+
+## 📝 Summary
+<1-3 sentences. Plain English. No praise.>
+
+## 🔧 Changes Overview
+- **<area/file>** — <concrete change, mention key \`symbols\`>
+- ... (≤6 bullets; group by area)
+
+## 🔍 Code Review
+**Correctness:** <one sentence tied to code>
+**Tests:** <coverage of changed logic / gaps>
+**Security & data integrity:** <auth, input handling, PII>
+**Performance / regressions:** <hot paths, N+1, allocations>
+
+**Prior reviewer feedback:**  ← if items exist, list bullets below; else REPLACE this whole line with '**Prior reviewer feedback:** None.'
+- <✅/⚠️/❌/❔> **[critical|major|minor|nit]** @user (\`path:line\`): \"<≤80 char quote>\" — <one-line resolution>
+
+**Findings:**  ← NEW only; don't restate Prior. If items exist, list bullets below; else REPLACE this whole line with '**Findings:** None.'
+- <🛑/⚠️/🟡/❓> **<SEVERITY>** — \`file:line\` — <one-line reason>
+
+**Conclusion:** <APPROVED ✅ | APPROVED WITH CAUTION ⚠️ | NEEDS CHANGES ❌ | NEEDS CLARIFICATION ❓>"
+
+TEMPLATE_INCREMENTAL="# PR #$PR_NUMBER Re-review (incremental) — $PR_TITLE_HEADER
+
+## 🆕 Commits since $PRIOR_REVIEW_SHA
+- <sha7> <subject>
+- ...
+
+## 🛑 Blocking Issues  ← if items, bullets below; else REPLACE with '## 🛑 Blocking Issues — None.'
+- <🛑/⚠️> **<SEVERITY>** — \`file:line\` — <one-line reason>
+
+## ↪ Prior reviewer follow-up  ← if items, bullets below; else REPLACE with '## ↪ Prior reviewer follow-up — None.'
+- <✅/⚠️/❌/❔> **[critical|major|minor|nit]** @user (\`path:line\`): \"<quote>\" — <resolution>
+
+**Conclusion:** <APPROVED ✅ | APPROVED WITH CAUTION ⚠️ | NEEDS CHANGES ❌ | NEEDS CLARIFICATION ❓>"
+
+if (( INCREMENTAL )); then
+  TEMPLATE="$TEMPLATE_INCREMENTAL"
+  MODE_NOTE="INCREMENTAL REVIEW. Prior review at \`$PRIOR_REVIEW_SHA\`. Current HEAD \`$HEAD_SHA\`. Focus only on diff since prior review. Skip MINOR/NIT findings."
+else
+  TEMPLATE="$TEMPLATE_FULL"
+  MODE_NOTE="FULL REVIEW (first time we are reviewing this PR)."
+fi
+
+if [[ -n "$COMMITS_SINCE" ]]; then
+  COMMITS_SECTION="
+## Commits since prior review
+$COMMITS_SINCE"
+else
+  COMMITS_SECTION=""
+fi
+
+SYSTEM_PROMPT="Senior PR reviewer. Output ONLY the review markdown — no preamble, no outer code fence. Cite file:line. No praise. Follow template exactly.
+
+Findings rules:
+- Only flag issues verifiable from the shown diff. If you must assume unseen behavior, omit.
+- BLOCKER = demonstrable harm: exploit with concrete attack path, broken invariant, data loss, or broken happy path. Throwing on bad input is the caller's contract, not a blocker.
+- Don't invent vuln classes wrong for the stack. \`new ObjectId(x)\` on Mongo throws on bad string — not SQL injection / RCE.
+- MAJOR = bug with named failure mode. \"Might edge-case\" without a trigger isn't MAJOR.
+- MINOR cap for style nits (\`eslint-disable\`, length, helper split, naming). Omit pure cosmetics.
+- Don't review unchanged code. One finding per logical issue.
+
+Empty-section rule (CRITICAL): when **Findings:** or **Prior reviewer feedback:** has no items, output ONE line only — '**Findings:** None.' or '**Prior reviewer feedback:** None.'. NEVER output both the empty header and a 'None.' bullet/line below it.
+
+Prior * sections (reviews / inline / issue / threads) are OTHER authors' comments — context only. Never restate them in Findings. Cite each once in **Prior reviewer feedback:** with a one-line resolution.
+
+Conclusion rules:
+- Findings empty + Prior empty → '**Conclusion:** APPROVED ✅'.
+- Findings has only MINOR → 'APPROVED WITH CAUTION ⚠️'.
+- Findings has BLOCKER or MAJOR → 'NEEDS CHANGES ❌'.
+- Genuinely cannot tell from diff → 'NEEDS CLARIFICATION ❓'.
+
+Bias: when unsure, omit. One real finding beats five speculative ones."
+
+USER_PROMPT="$MODE_NOTE
+
+PR metadata:
+- Repo: $FULL_REPO
+- Number: $PR_NUMBER
+- Title: $PR_TITLE
+- Author: @$PR_AUTHOR
+- Stats: +$PR_ADD / -$PR_DEL across $PR_CHANGED files
+- HEAD: $HEAD_SHA
+- Base: $PR_BASE ($DIFF_BASE)
+
+## PR description
+$PR_BODY
+
+## Changed files
+$CHANGED_FILES
+
+## Diff (unified, U${HUNK_CONTEXT_LINES} context)${DIFF_TRUNCATED_NOTE}
+\`\`\`diff
+$DIFF
+\`\`\`
+$COMMITS_SECTION
+
+$CALLERS_SECTION
+
+## Prior reviews
+$REVIEWS
+
+## Prior inline review comments
+$INLINE_COMMENTS
+
+## Prior issue comments
+$ISSUE_COMMENTS
+
+## Active review threads (unresolved, non-outdated)
+$REVIEW_THREADS_ACTIVE
+
+---
+
+Output the review markdown matching EXACTLY this template (replace angle-bracket placeholders, keep all section headers verbatim, end on the **Conclusion:** line — no footer, no horizontal rule, no date, no model name):
+
+$TEMPLATE"
+
+# --- Call llama-server ---
+echo "Calling llama-server (model=$LLAMA_MODEL, prompt bytes=${#USER_PROMPT})..."
+
+REQ_JSON="$(jq -n \
+  --arg model "$LLAMA_MODEL" \
+  --arg sys "$SYSTEM_PROMPT" \
+  --arg user "$USER_PROMPT" \
+  --argjson max_tokens "$MAX_TOKENS" \
+  '{
+    model: $model,
+    messages: [
+      { role: "system", content: $sys },
+      { role: "user", content: $user }
+    ],
+    temperature: 0.2,
+    top_p: 0.9,
+    max_tokens: $max_tokens,
+    stream: false
+  }'
+)"
+
+RESP="$(curl -s -X POST "$LLAMA_URL/v1/chat/completions" \
+  -H 'content-type: application/json' \
+  -d "$REQ_JSON")"
+
+REVIEW_MD="$(jq -r '.choices[0].message.content // ""' <<<"$RESP")"
+REASONING="$(jq -r '.choices[0].message.reasoning_content // ""' <<<"$RESP" 2>/dev/null || true)"
+FINISH_REASON="$(jq -r '.choices[0].finish_reason // ""' <<<"$RESP" 2>/dev/null || true)"
+
+if [[ -z "$REVIEW_MD" || ! "$REVIEW_MD" =~ "Conclusion:" ]]; then
+  echo "ERROR: model output missing Conclusion line. finish_reason=$FINISH_REASON, content_len=${#REVIEW_MD}, reasoning_len=${#REASONING}" >&2
+  if [[ "$FINISH_REASON" == "length" && -z "$REVIEW_MD" && -n "$REASONING" ]]; then
+    echo "Hint: thinking budget exhausted before answer. Raise MAX_TOKENS (current=$MAX_TOKENS) or shrink prompt." >&2
+  fi
+  echo "---response head---" >&2
+  printf '%s' "$RESP" | head -c 2000 >&2
+  echo >&2
+  exit 4
+fi
+
+# --- Post review ---
+echo "$REVIEW_MD" > pr-review.md
+if [[ -n "$VERIFY_MENTION" ]]; then
+  printf '\n\n---\n%s\n' "$VERIFY_MENTION" >> pr-review.md
+fi
+gh pr comment "$PR_NUMBER" --repo "$FULL_REPO" --body-file pr-review.md
+echo "Posted review comment for $FULL_REPO #$PR_NUMBER."
+
+if grep -qE '\*\*Conclusion:\*\*[^\n]*APPROVED' pr-review.md \
+  && ! grep -qE '\*\*Conclusion:\*\*[^\n]*NEEDS' pr-review.md; then
+  gh pr review "$PR_NUMBER" --repo "$FULL_REPO" --approve \
+    --body "Approved based on review result." || echo "WARN: gh pr review --approve failed."
+  echo "Approved PR #$PR_NUMBER."
+fi
+
+rm -f pr-review.md
+echo "Done."

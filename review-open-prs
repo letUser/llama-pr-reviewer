@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Scanner: enumerate open PRs across configured repos, queue eligible ones,
+# kick off pr-review-queue as a transient systemd --user unit.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="${PR_REVIEWER_HOME:-$SCRIPT_DIR}"
+CONFIG="$DATA_DIR/.env"
+if [[ -f "$CONFIG" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG"
+fi
+
+OWNER="${OWNER:?OWNER env var required (GitHub org/user that owns the repos). Set in $CONFIG}"
+REPOS="${REPOS:?REPOS env var required (space-separated repo names under \$OWNER). Set in $CONFIG}"
+LOOKBACK_HOURS="${LOOKBACK_HOURS:-12}"
+
+# Locate a GNU-compatible date (BSD/macOS `date` lacks `-d`).
+if date -d @0 +%s >/dev/null 2>&1; then
+  DATE_CMD=date
+elif command -v gdate >/dev/null 2>&1 && gdate -d @0 +%s >/dev/null 2>&1; then
+  DATE_CMD=gdate
+else
+  echo "ERROR: GNU date required. On macOS: brew install coreutils." >&2
+  exit 1
+fi
+
+QUEUE_DIR="$DATA_DIR/.cache"
+QUEUE_FILE="$QUEUE_DIR/queue.tsv"
+QUEUE_RUNNER="${QUEUE_RUNNER:-$SCRIPT_DIR/pr-review-queue}"
+
+# Comma-separated base ref names to skip entirely (e.g. main, master).
+# Release branches matched by prefix below.
+SKIP_BASE_REFS="${SKIP_BASE_REFS:-main,master}"
+SKIP_BASE_PREFIXES="${SKIP_BASE_PREFIXES:-release/}"
+
+mkdir -p "$QUEUE_DIR"
+
+gh auth status >/dev/null
+
+export LOGIN
+LOGIN="$(gh api user --jq .login)"
+
+cutoff_epoch="$("$DATE_CMD" -u -d "${LOOKBACK_HOURS} hours ago" +%s)"
+
+# Build jq filter for skipping base refs from env config.
+build_base_filter() {
+  local exact_jq="" prefix_jq=""
+  IFS=',' read -ra _exact <<<"$SKIP_BASE_REFS"
+  for r in "${_exact[@]}"; do
+    r="${r// /}"
+    [[ -z "$r" ]] && continue
+    exact_jq+="${exact_jq:+ and }.baseRefName != \"$r\""
+  done
+  IFS=',' read -ra _prefixes <<<"$SKIP_BASE_PREFIXES"
+  for p in "${_prefixes[@]}"; do
+    p="${p// /}"
+    [[ -z "$p" ]] && continue
+    prefix_jq+="${prefix_jq:+ and }(.baseRefName | startswith(\"$p\") | not)"
+  done
+  local combined=""
+  [[ -n "$exact_jq" ]] && combined="$exact_jq"
+  if [[ -n "$prefix_jq" ]]; then
+    combined="${combined:+$combined and }$prefix_jq"
+  fi
+  [[ -z "$combined" ]] && combined="true"
+  echo "$combined"
+}
+BASE_FILTER="$(build_base_filter)"
+
+tmp_queue="$(mktemp)"
+trap 'rm -f "$tmp_queue"' EXIT
+
+for repo in $REPOS; do
+  full_repo="$OWNER/$repo"
+
+  gh pr list \
+    --repo "$full_repo" \
+    --state open \
+    --limit 100 \
+    --json number,createdAt,isDraft,baseRefName \
+    --jq ".[]
+    | select(.isDraft == false)
+    | select($BASE_FILTER)
+    | [.number, .createdAt, .baseRefName]
+    | @tsv" |
+  while IFS=$'\t' read -r pr_number created_at base_ref; do
+    [[ -z "${pr_number:-}" ]] && continue
+
+    created_epoch="$("$DATE_CMD" -u -d "$created_at" +%s)"
+    if (( created_epoch < cutoff_epoch )); then
+      continue
+    fi
+
+    already_approved="$(
+      gh pr view "$pr_number" \
+        --repo "$full_repo" \
+        --json reviews \
+        --jq '.reviews[]? | select(.author.login == env.LOGIN and .state == "APPROVED") | .state' || true
+    )"
+
+    if [[ -n "$already_approved" ]]; then
+      echo "Skip $full_repo#$pr_number: already approved by $LOGIN"
+      continue
+    fi
+
+    echo "Queue $full_repo#$pr_number"
+    printf '%s\t%s\n' "$repo" "$pr_number" >> "$tmp_queue"
+  done
+done
+
+if [[ ! -s "$tmp_queue" ]]; then
+  echo "No eligible PRs found."
+  exit 0
+fi
+
+cp "$tmp_queue" "$QUEUE_FILE"
+
+echo "Queued PRs:"
+cat "$QUEUE_FILE"
+
+NOTIFY_TARGET="${NOTIFY_TARGET:-}"
+NOTIFY_CHANNEL="${NOTIFY_CHANNEL:-}"
+notify() {
+  local msg="$1"
+  [[ -z "$NOTIFY_TARGET" || -z "$NOTIFY_CHANNEL" ]] && return 0
+  bash -lc "
+    source \"\$HOME/.nvm/nvm.sh\" >/dev/null 2>&1 && nvm use 22 >/dev/null 2>&1
+    openclaw message send --channel '$NOTIFY_CHANNEL' --target '$NOTIFY_TARGET' --message \"\$1\" >/dev/null 2>&1
+  " _ "$msg" || true
+}
+
+queued_list="$(awk -F'\t' '{printf "- %s#%s\n", $1, $2}' "$QUEUE_FILE")"
+notify "🌿 PR review queue starting (${OWNER}):
+$queued_list"
+
+systemd-run --user \
+  --collect \
+  --unit pr-review-queue \
+  "$QUEUE_RUNNER"
+
+echo "Started queue runner: pr-review-queue"

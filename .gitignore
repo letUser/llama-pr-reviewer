@@ -1,0 +1,11 @@
+# Local env with secrets/identifiers
+.env
+
+# Runtime state
+.cache/
+.share/
+
+# Backups / scratch
+*.bak
+*.orig
+pr-review.md

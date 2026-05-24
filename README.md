@@ -1,0 +1,137 @@
+# pr-reviewer
+
+Self-hosted PR review bot. Scans open PRs on a GitHub org, sends each diff to a
+local llama-server, posts a structured review comment, and auto-approves on
+clean runs.
+
+No agent loop, no tool calls — one model invocation per PR. Tuned for fast,
+deterministic batch review on a single GPU box.
+
+## Pipeline
+
+```
+review-open-prs  → fills queue.tsv with eligible PRs, launches queue runner as
+                   transient systemd --user unit (pr-review-queue) ↓
+pr-review-queue  → drains queue.tsv under flock, calls per PR, sends summary ↓
+pr-review-one    → fetches diff + context, calls llama-server, posts review,
+                   erases llama-server slot 0 on exit to free VRAM
+```
+
+### Worker exit codes (`pr-review-one`)
+
+| Code | Meaning |
+|------|---------|
+| `0` | Review posted (or triage-skip auto-approved) |
+| `100` | Skipped — already reviewed at current HEAD |
+| `101` | Skipped — PR author in `SKIP_AUTHORS` |
+| `4` | Model output missing `Conclusion:` line |
+| other | Worker failure |
+
+The queue runner uses these to classify each PR in the completion summary.
+
+## Requirements
+
+- `bash` 4+
+- [`gh`](https://cli.github.com/) (authenticated: `gh auth login`)
+- `jq`
+- `curl`, `awk`, `sed`, `git`, `flock`
+- A running [llama-server](https://github.com/ggml-org/llama.cpp) (OpenAI-compatible endpoint) with **~45K token context minimum** (120KB diff + prompt + ~8K response)
+- `systemd --user` (only for the timer + `RESTART_LLAMA=1` auto-restart features)
+- `openclaw` (optional, for queue start/done notifications via `NOTIFY_TARGET` — supports any channel openclaw exposes: telegram, whatsapp, etc.)
+
+### Platform support
+
+| OS | Status | Notes |
+|----|--------|-------|
+| Linux | supported | primary target |
+| macOS | works with extras | `brew install bash flock coreutils` (coreutils provides `gdate`; scripts auto-detect). No `systemd` features (use launchd/cron manually). |
+| Windows | WSL only | run inside WSL2 Linux |
+| BSD | works with extras | needs `bash` 4+, `flock`, and GNU `date` (install `coreutils`, scripts pick up `gdate`). No `systemd` features. |
+
+## Setup
+
+```bash
+git clone https://github.com/letUser/llama-pr-reviewer.git
+cd llama-pr-reviewer
+cp .env.example .env
+$EDITOR .env        # set OWNER, REPOS, LLAMA_URL, LLAMA_MODEL
+```
+
+Required env vars (see `.env.example`):
+- `OWNER` — GitHub org/user that owns the repos
+- `REPOS` — space-separated repo names under `$OWNER`
+- `LLAMA_URL` — llama-server OpenAI endpoint (e.g. `http://127.0.0.1:8082`)
+- `LLAMA_MODEL` — model name advertised by llama-server
+
+## Usage
+
+### One-shot review of a single PR
+
+```bash
+./pr-review-one <repo> <pr_number>
+```
+
+### Scan + queue + drain (manual)
+
+```bash
+./review-open-prs        # finds eligible open PRs, fills queue, starts queue
+```
+
+### Scheduled scan via systemd --user
+
+Sample units in `systemd/`. Link them in-place (edits to the unit files in this repo take effect after `daemon-reload`):
+
+```bash
+systemctl --user link "$PWD/systemd/pr-review-scan.service"
+systemctl --user link "$PWD/systemd/pr-review-scan.timer"
+systemctl --user daemon-reload
+systemctl --user enable --now pr-review-scan.timer
+```
+
+Note: paths must be absolute (hence `$PWD/...`). Moving or renaming this directory breaks the symlinks — re-run the `link` commands.
+
+Default cadence: every 30 minutes (edit timer to taste).
+
+## Config knobs (highlights)
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `LOOKBACK_HOURS` | `12` | Only consider PRs created within last N hours |
+| `SKIP_BASE_REFS` | `main,master` | Base refs to skip (exact match) |
+| `SKIP_BASE_PREFIXES` | `release/` | Base ref prefixes to skip |
+| `SKIP_AUTHORS` | — | PR authors to skip entirely |
+| `SKIP_PRIOR_AUTHORS` | — | Comment authors whose prior reviews are hidden from model |
+| `VERIFY_BOT` | — | GitHub login to `@`-mention at end of review |
+| `RESTART_LLAMA` | `0` | Restart llama-server systemd unit between batches (frees VRAM) |
+| `LLAMA_UNIT` | — | systemd --user unit name (required if `RESTART_LLAMA=1`) |
+| `NOTIFY_TARGET` | — | Notification target ID for queue start/done events (requires `openclaw`). Empty = no notify |
+| `NOTIFY_CHANNEL` | `telegram` | openclaw channel (`telegram`, `whatsapp`, etc — any channel openclaw supports) |
+| `MAX_DIFF_BYTES` | `120000` | Diff truncation budget |
+| `MAX_TOKENS` | `8192` | LLM response token budget |
+| `PR_REVIEWER_HOME` | script dir | Override location of `.env`, `.cache`, `.share` |
+| `WORKSPACE_BASE` | `$PR_REVIEWER_HOME/.share` | Override clone location |
+| `WORKER` | sibling `pr-review-one` | Path to worker used by queue runner |
+| `QUEUE_RUNNER` | sibling `pr-review-queue` | Path to queue runner used by scanner |
+
+Full list in `.env.example`.
+
+## What the reviewer optimizes for
+
+- **Triage gate**: lockfiles, binaries, minified, whitespace-only, dependency-only PRs auto-approved without calling the model.
+- **Tight prompt**: U20 diff context, changed-symbol extraction + git grep caller hits, compact one-line comment summaries.
+- **No prior-self echo**: the bot's own past comments (plus `SKIP_PRIOR_AUTHORS` + `VERIFY_BOT`) are filtered out so it never restates itself across re-reviews.
+- **Active threads only**: unresolved, non-outdated review threads pulled via GraphQL — resolved/outdated ones ignored.
+- **Incremental mode**: prior reviewed SHA inferred from the bot's last comment timestamp; only the new range is reviewed.
+- **Strict template**: model output forced into a known shape; conclusion line drives auto-approve (only fires when `APPROVED` present and `NEEDS` absent).
+- **VRAM hygiene**: each worker run erases llama-server slot 0 on exit; optional full `LLAMA_UNIT` restart between batches via `RESTART_LLAMA=1`.
+
+## Notifications
+
+When `NOTIFY_TARGET` + `NOTIFY_CHANNEL` are set, two messages per run are sent via `openclaw`:
+
+1. **Queue start** (from `review-open-prs`): list of queued `repo#pr` items.
+2. **Queue done** (from `pr-review-queue`): per-PR outcome line with emoji — ✅ approved, ⚠️ approved with caution, ❌ needs changes, ❓ needs clarification, 💬 commented, ⏭ skipped (already reviewed / author skipped), 🔥 worker failure — plus the PR URL.
+
+## License
+
+MIT — see `LICENSE`.

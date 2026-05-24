@@ -1,0 +1,10 @@
+[Unit]
+Description=Scan open PRs and queue reviews
+
+[Service]
+Type=oneshot
+# Edit this path to point at your clone of the repo.
+ExecStart=%h/pr-reviewer/review-open-prs
+
+[Install]
+WantedBy=default.target
