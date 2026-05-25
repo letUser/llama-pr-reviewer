@@ -85,7 +85,7 @@ The queue runner uses these to classify each PR in the completion summary.
 ## Setup
 
 ```bash
-git clone https://github.com/letUser/llama-pr-reviewer.git
+git clone https://github.com/dan-sotnik/llama-pr-reviewer.git
 cd llama-pr-reviewer
 cp .env.example .env
 $EDITOR .env        # set OWNER, REPOS, LLAMA_URL, LLAMA_MODEL
