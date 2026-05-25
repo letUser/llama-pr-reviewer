@@ -9,20 +9,25 @@ deterministic batch review on a single GPU box.
 
 ## Hardware requirements
 
-Designed to run fully local on consumer GPUs. Reference target: a 9B-class Q4
-reasoning model with Q8 KV cache and partial offload on **8 GB VRAM**.
+Designed to run fully local on consumer GPUs. Reference target: **8 GB VRAM +
+32 GB RAM** running a 30B MoE coder model (3B active params) with experts on
+CPU via `-cmoe`.
 
-| Tier | VRAM | Model | Offload | KV cache | Context | Throughput |
-|------|------|-------|---------|----------|---------|------------|
-| Minimum | 6 GB | 9B Q4 | `-ngl 18` | Q8 | 64K | ~800–1500 changed LOC per review |
-| Reference | 8 GB | 9B Q4 | `-ngl 24` | Q8 | 128K | ~2K changed LOC per review |
-| Headroom | 12–16 GB | 9B Q4 or 14B Q4 | full (`-ngl 99`) | F16 | 256K+ | Larger diffs, bigger reasoning budgets, faster wall time |
+| Tier | VRAM | RAM | Model | Offload | KV cache | Context | Throughput |
+|------|------|-----|-------|---------|----------|---------|------------|
+| Minimum | 6 GB | 16 GB | 9B Q4 dense | `-ngl 18` | Q8 K / Q4 V | 32K | ~500–800 changed LOC per review |
+| **Reference** | **8 GB** | **32 GB** | **Qwen3-Coder 30B-A3B Q4 (MoE)** | `-ngl 99 -cmoe` (experts on CPU) | Q8 K / Q8 V | **64K** | **~3K LOC per review, ~25 t/s TG, ~200 t/s PP** |
+| Alt-Reference | 8 GB | 16 GB | 9B Q4 dense reasoning | full (`-ngl 33`) + `-fa on` | Q8 K / Q4 V | 64K | ~3K LOC, ~40 t/s TG but verbose 6K-token reasoning output |
+| Headroom | 12–24 GB | 32–64 GB | 30B-A3B Q5/Q6 or 70B Q4 | full | Q8 / F16 | 128K+ | Larger diffs, higher quant quality, sub-30s typical review |
 
-The 8 GB row is the actively tested configuration.
+The 8 GB / 32 GB row is the actively tested configuration. The MoE strategy
+(small attention/shared on GPU, experts streamed from RAM) needs ~12 CPU
+threads — match `--threads N` to your physical core count for ~3× TG over the
+default thread setting.
 
 Host requirements are minimal: `bash`, `jq`, `curl`, `git`. No GPU-side
 dependencies beyond `llama-server`. Tuning flags and `.env` values for each
-tier are in [Example: 8 GB VRAM with Q8 KV cache + reasoning model](#example-8-gb-vram-with-q8-kv-cache--reasoning-model).
+tier are in [Example: 8 GB VRAM + 32 GB RAM with Qwen3-Coder 30B-A3B MoE](#example-8-gb-vram--32-gb-ram-with-qwen3-coder-30b-a3b-moe-recommended).
 
 ## Pipeline
 
@@ -64,7 +69,7 @@ The queue runner uses these to classify each PR in the completion summary.
 - [`gh`](https://cli.github.com/) (authenticated: `gh auth login`)
 - `jq`
 - `curl`, `awk`, `sed`, `git`, `flock`
-- A running [llama-server](https://github.com/ggml-org/llama.cpp) (OpenAI-compatible endpoint) with **~64K token context** (`CTX_SIZE` default). Reasoning models need headroom — prompt ≤ ~30K + `MAX_TOKENS` output budget (default 16K, raise for chatty reasoning models).
+- A running [llama-server](https://github.com/ggml-org/llama.cpp) (OpenAI-compatible endpoint) with **64K token context** (`CTX_SIZE` default; raise to 128K for very large PRs at the cost of partial offload and slower TG). Default coder MoE config: prompt ≤ ~47K + `MAX_TOKENS` output budget (default 16K). For reasoning fallback models, raise `MAX_TOKENS` to 24576+ for chain-of-thought headroom.
 - `systemd --user` (only for the timer + `RESTART_LLAMA=1` auto-restart features)
 - `openclaw` (optional, for queue start/done notifications via `NOTIFY_TARGET` — supports any channel openclaw exposes: telegram, whatsapp, etc.)
 
@@ -73,9 +78,9 @@ The queue runner uses these to classify each PR in the completion summary.
 | OS | Status | Notes |
 |----|--------|-------|
 | Linux | supported | primary target |
-| macOS | works with extras | `brew install bash flock coreutils` (coreutils provides `gdate`; scripts auto-detect). No `systemd` features (use launchd/cron manually). |
+| macOS | works with extras | `brew install bash flock coreutils` (coreutils provides `gdate`; scripts auto-detect). `scan-open-prs` falls back to `nohup` when `systemd --user` absent; schedule it via `launchd`/`cron`. |
 | Windows | WSL only | run inside WSL2 Linux |
-| BSD | works with extras | needs `bash` 4+, `flock`, and GNU `date` (install `coreutils`, scripts pick up `gdate`). No `systemd` features. |
+| BSD | works with extras | needs `bash` 4+, `flock`, and GNU `date` (install `coreutils`, scripts pick up `gdate`). `scan-open-prs` uses `nohup` fallback; schedule via `cron`. |
 
 ## Setup
 
@@ -133,8 +138,8 @@ Default cadence: every 30 minutes (edit timer to taste).
 | `LLAMA_UNIT` | — | systemd --user unit name (required if `RESTART_LLAMA=1`) |
 | `NOTIFY_TARGET` | — | Notification target ID for queue start/done events (requires `openclaw`). Empty = no notify |
 | `NOTIFY_CHANNEL` | `telegram` | openclaw channel (`telegram`, `whatsapp`, etc — any channel openclaw supports) |
-| `MAX_DIFF_BYTES` | `120000` | Diff truncation budget (soft cap) |
-| `OVERSIZE_DIFF_BYTES` | `360000` | Hard cap. Above this, model is skipped; reviewer posts "needs human review" + `@BOT_OWNER` mention |
+| `MAX_DIFF_BYTES` | `160000` | Diff truncation budget (soft cap) |
+| `OVERSIZE_DIFF_BYTES` | `240000` | Hard cap. Above this, model is skipped; reviewer posts "needs human review" + `@BOT_OWNER` mention |
 | `BOT_OWNER` | — | GitHub login of bot owner to `@`-mention (no `@`) |
 | `MAX_TOKENS` | `16384` | Output token cap (`n_predict`). Reasoning models burn tokens before answer — raise on `finish_reason=length` |
 | `CTX_SIZE` | `65536` | llama-server context window. Worker aborts (exit 5) if prompt + `MAX_TOKENS` won't fit |
@@ -211,13 +216,62 @@ answer — exit 4. Three llama-server flags address this:
 If your llama-server build lacks `--reasoning-budget`, fall back to oversizing
 `MAX_TOKENS` (e.g. `49152`) and accept longer review wall time.
 
-### Example: 8 GB VRAM with Q8 KV cache + reasoning model
+### Example: 8 GB VRAM + 32 GB RAM with Qwen3-Coder 30B-A3B MoE (recommended)
 
 llama-server flags:
 
 ```
--c 131072 \
---cache-type-k q8_0 --cache-type-v q8_0 \
+-m Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf \
+-ngl 99 \
+-cmoe \
+--threads 12 --threads-batch 12 \
+-c 65536 \
+-fa on \
+--cache-type-k q8_0 --cache-type-v q8_0
+```
+
+`-cmoe` keeps all 128×48 expert tensors on CPU; only attention/shared layers +
+KV cache live on GPU. Lands around **5.5 GB VRAM + ~20 GB RAM** for the model.
+`--threads 12` matches the physical core count of a Ryzen 7 5800H (8c/16t) —
+default is 8, raising to 12 gives a ~3× TG bump because MoE expert matmuls run
+on CPU.
+
+Non-reasoning coder model — no `--reasoning-budget` / `--reasoning-format`
+needed. Output is direct (~300–500 tokens for a typical review vs 5–6K for a
+reasoning model), so wall-clock is dominated by prompt eval, not generation.
+No `--dry-*` or `--repeat-penalty` either — those defend against CoT
+repetition loops that only happen in small reasoning models. On a specialized
+coder they risk penalizing legitimate code repetition (`}\n})`, repeated
+imports, identical param names).
+
+Expected throughput: **~200 t/s PP, ~25 t/s TG, sub-minute reviews** for
+sub-1K-LOC PRs.
+
+Then in `.env`:
+
+```bash
+CTX_SIZE=65536
+CTX_SAFETY_MARGIN=2048
+MAX_TOKENS=16384
+HUNK_CONTEXT_LINES=3
+MAX_DIFF_BYTES=160000
+OVERSIZE_DIFF_BYTES=240000
+```
+
+Prompt budget: `65536 - 2048 - 16384 = 47104` tokens ≈ ~150 KB of diff
+possible (capped earlier by `MAX_DIFF_BYTES`), ~3K changed lines per review.
+
+#### Alt: 9B dense reasoning model on 8 GB VRAM
+
+If you don't have 32 GB RAM or prefer a single-card all-GPU setup, the older
+9B reasoning config still works:
+
+```
+-m Qwen3.5-9B-Q4_K_M.gguf \
+-ngl 33 \
+-c 65536 \
+-fa on \
+--cache-type-k q8_0 --cache-type-v q4_0 \
 --reasoning-format deepseek \
 --reasoning-budget 8000 \
 --dry-multiplier 0.8 \
@@ -227,30 +281,41 @@ llama-server flags:
 --repeat-last-n 256
 ```
 
-With a 9B-class Q4 model and partial offload (`-ngl 24`) this lands around
-7 GB VRAM. Then in `.env`:
+```bash
+CTX_SIZE=65536
+MAX_TOKENS=24576          # ~8K thinking + ~16K answer headroom
+```
+
+~40 t/s TG, but the reasoning model burns 5–6K tokens per review (vs ~400 for
+the coder MoE), so wall-clock is ~4–6× slower despite higher TG.
+
+#### 128K context variant for the coder MoE
+
+If you regularly hit 3K+ LOC PRs and need a bigger window with the same coder
+model, drop V cache to q4 to keep VRAM in budget:
+
+```
+-m Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf \
+-ngl 99 \
+-cmoe \
+--threads 12 --threads-batch 12 \
+-c 131072 \
+-fa on \
+--cache-type-k q8_0 --cache-type-v q4_0
+```
 
 ```bash
 CTX_SIZE=131072
-CTX_SAFETY_MARGIN=2048
-MAX_TOKENS=24576          # ~8K thinking + ~16K answer headroom
-HUNK_CONTEXT_LINES=3
-MAX_DIFF_BYTES=240000
-```
-
-Prompt budget: `131072 - 2048 - 24576 = 104448` tokens ≈ ~300 KB of diff
-possible (capped earlier by `MAX_DIFF_BYTES`), ~2000+ changed lines per review.
-
-For a 64K-ctx ~5.5 GB VRAM setup (same reasoning flags, smaller window):
-
-```bash
-CTX_SIZE=65536
 MAX_TOKENS=16384
-HUNK_CONTEXT_LINES=3
-MAX_DIFF_BYTES=110000
+MAX_DIFF_BYTES=240000
+OVERSIZE_DIFF_BYTES=360000
 ```
 
-Prompt budget: ~48 K tokens ≈ ~130 KB, ~800–1500 changed lines.
+KV cache jumps from ~3.2 GB (64K Q8/Q8) to ~4.8 GB (128K Q8/Q4) — fits the
+~6 GB VRAM budget left after attention/shared layers. TG drops slightly
+(~20 t/s) because KV reads scale linearly with context fill. For repos where
+the OVERSIZE_DIFF_BYTES routing already captures the outlier mega-PRs, stick
+with the 64K default — wall-clock will be faster on the common case.
 
 ## What the reviewer optimizes for
 
@@ -320,9 +385,11 @@ When `NOTIFY_TARGET` + `NOTIFY_CHANNEL` are set, two messages per run are sent v
 
 ## Limitations
 
-Tested mostly against a 9B-class Q4 reasoning model (`Qwen3.5-9B-Q4_K_M`). Output quality and behavior scale with model size and quality. Specific known issues:
+Tested against Qwen3-Coder-30B-A3B (UD-Q4_K_XL) as the primary model and
+Qwen3.5-9B-Q4_K_M as the fallback. Output quality and behavior scale with model
+size and quality. Specific known issues:
 
-- **PR size ceiling**: for diffs above ~2K LOC the prompt approaches the 64K-128K context budget, and small reasoning models burn the `--reasoning-budget` on filename / identifier fragmentation loops before emitting the review. Practical cap around 1.5K–2K changed LOC; very large refactors will need manual review (or per-file chunking — not implemented yet).
+- **PR size ceiling**: at the 64K-ctx default the practical cap is ~3K changed LOC. Above that, small models burn output budget on filename / identifier fragmentation loops before emitting the review. Very large refactors will need manual review (or per-file chunking — not implemented yet); `OVERSIZE_DIFF_BYTES` already routes the worst offenders to the human path.
 - **Tokenizer-induced spiral**: the model sometimes re-reads the diff and "sees" hallucinated typos (missing `this.`, stray commas, broken brackets). The trust-first-read clamp in SYSTEM_PROMPT suppresses these as findings, but the wasted reasoning tokens still count against `MAX_TOKENS` and slow wall-clock time.
 - **Citation precision**: findings cite by filename only (no line numbers). Restoring exact paths is reliable via the F1/F2 alias system; line numbers are dropped because small models can't read hunk offsets without recomputing them and getting them wrong.
 

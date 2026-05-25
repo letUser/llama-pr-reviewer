@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Scanner: enumerate open PRs across configured repos, queue eligible ones,
-# kick off review-queue as a transient systemd --user unit.
+# kick off review-queue as a transient systemd --user unit (or background
+# process via nohup on systems without systemd --user).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -134,9 +135,22 @@ queued_list="$(awk -F'\t' '{printf "- %s#%s\n", $1, $2}' "$QUEUE_FILE")"
 notify "🌿 PR review queue starting (${OWNER}):
 $queued_list"
 
-systemd-run --user \
-  --collect \
-  --unit review-queue \
-  "$QUEUE_RUNNER"
-
-echo "Started queue runner: review-queue"
+if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  systemd-run --user \
+    --collect \
+    --unit review-queue \
+    "$QUEUE_RUNNER"
+  echo "Started queue runner: review-queue (systemd --user transient unit)"
+else
+  LOG_DIR="$DATA_DIR/.cache"
+  LOG_FILE="$LOG_DIR/review-queue.log"
+  PID_FILE="$LOG_DIR/review-queue.pid"
+  if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "review-queue already running (pid $(cat "$PID_FILE")); skipping launch" >&2
+    exit 0
+  fi
+  nohup "$QUEUE_RUNNER" >>"$LOG_FILE" 2>&1 &
+  echo $! >"$PID_FILE"
+  disown || true
+  echo "Started queue runner: pid $(cat "$PID_FILE"), log $LOG_FILE"
+fi
