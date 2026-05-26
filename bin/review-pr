@@ -149,19 +149,43 @@ PR_DEL="$(jq -r '.deletions' <<<"$PR_JSON")"
 PR_CHANGED="$(jq -r '.changedFiles' <<<"$PR_JSON")"
 
 # Determine diff range.
+#
+# DIFF_BASE is ALWAYS the merge-base with the PR's target branch, so the diff is
+# the PR's own net change. A two-dot `git diff PRIOR..HEAD` would instead include
+# everything a `Merge branch development` commit dragged in (other tickets), so
+# we never base the diff on the prior-review SHA directly.
+#
+# Incremental mode narrows the *same* PR diff to files the PR's own commits
+# touched since the prior review, via a positive pathspec. `--no-merges` drops
+# merge commits, so files brought in only by a development merge never enter the
+# path set — they are not part of this PR's work.
+DIFF_BASE="$(git merge-base "origin/$PR_BASE" "$HEAD_SHA" 2>/dev/null || echo "origin/$PR_BASE")"
+INCR_PATHS=()
+COMMITS_SINCE=""
 if (( INCREMENTAL )); then
-  DIFF_BASE="$PRIOR_REVIEW_SHA"
-  COMMITS_SINCE="$(git log --oneline "$PRIOR_REVIEW_SHA..$HEAD_SHA" || true)"
-else
-  DIFF_BASE="$(git merge-base "origin/$PR_BASE" "$HEAD_SHA" 2>/dev/null || echo "origin/$PR_BASE")"
-  COMMITS_SINCE=""
+  # PR-own commits since prior review: reachable from HEAD but NOT from the base
+  # branch and NOT already reviewed. The `^origin/$PR_BASE` exclusion drops every
+  # commit a `Merge branch development` dragged in transitively — those are
+  # reachable from the base branch, so they are not this PR's work.
+  COMMITS_SINCE="$(git log --oneline --no-merges "$HEAD_SHA" "^origin/$PR_BASE" "^$PRIOR_REVIEW_SHA" || true)"
+  while IFS= read -r _p; do
+    [[ -n "$_p" ]] && INCR_PATHS+=("$_p")
+  done < <(git log --no-merges --pretty=format: --name-only "$HEAD_SHA" "^origin/$PR_BASE" "^$PRIOR_REVIEW_SHA" 2>/dev/null | sort -u)
+  # Incremental but no PR-own files changed since prior review (only merges from
+  # the base branch). Nothing new to review → re-approve via the noise skip path.
+  if (( ${#INCR_PATHS[@]} == 0 )); then
+    echo "Incremental: no PR-own files changed since prior review (only base-branch merges)."
+    triage_skip_approve "no PR-own changes since prior review at $PRIOR_REVIEW_SHA" "$PR_NUMBER" "$FULL_REPO" "$PR_TITLE"
+    echo "Done (incremental no-op)."
+    exit 0
+  fi
 fi
 
 # Raw (unfiltered) diff + file list — used only for the triage gate so that
 # all-noise PRs still get auto-skipped. The filtered versions sent to the model
 # are computed after the triage gate.
-DIFF_RAW_FULL="$(git diff "-U${HUNK_CONTEXT_LINES}" "$DIFF_BASE..$HEAD_SHA" | strip_diff_noise || true)"
-CHANGED_FILES_ALL="$(git diff --name-only "$DIFF_BASE..$HEAD_SHA" 2>/dev/null || true)"
+DIFF_RAW_FULL="$(git diff "-U${HUNK_CONTEXT_LINES}" "$DIFF_BASE..$HEAD_SHA" -- "${INCR_PATHS[@]}" | strip_diff_noise || true)"
+CHANGED_FILES_ALL="$(git diff --name-only "$DIFF_BASE..$HEAD_SHA" -- "${INCR_PATHS[@]}" 2>/dev/null || true)"
 
 # --- Triage gate: skip model entirely on trivial diffs ---
 classify_triage "$DIFF_RAW_FULL" "$CHANGED_FILES_ALL" "$DIFF_BASE" "$HEAD_SHA"
@@ -174,8 +198,8 @@ if [[ -n "$TRIAGE_SKIP_REASON" ]]; then
 fi
 
 # --- Filtered diff + file list sent to model ---
-DIFF_RAW="$(git diff "-U${HUNK_CONTEXT_LINES}" "$DIFF_BASE..$HEAD_SHA" -- "${NOISE_PATHSPECS[@]}" | strip_diff_noise || true)"
-CHANGED_FILES="$(git diff --name-only "$DIFF_BASE..$HEAD_SHA" -- "${NOISE_PATHSPECS[@]}" 2>/dev/null || true)"
+DIFF_RAW="$(git diff "-U${HUNK_CONTEXT_LINES}" "$DIFF_BASE..$HEAD_SHA" -- "${INCR_PATHS[@]}" "${NOISE_PATHSPECS[@]}" | strip_diff_noise || true)"
+CHANGED_FILES="$(git diff --name-only "$DIFF_BASE..$HEAD_SHA" -- "${INCR_PATHS[@]}" "${NOISE_PATHSPECS[@]}" 2>/dev/null || true)"
 NOISE_FILTERED=0
 [[ "$CHANGED_FILES" != "$CHANGED_FILES_ALL" ]] && NOISE_FILTERED=1
 DIFF_BYTES="${#DIFF_RAW}"

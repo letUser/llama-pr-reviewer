@@ -81,8 +81,21 @@ build_prompts() {
 ## 🆕 Commits since $prior_review_sha
 - <sha7> <subject>
 
-## 🛑 Blocking Issues — None.
-## ↪ Prior reviewer follow-up — None.
+## 📝 Summary
+<1-3 sentences.>
+
+## 🔧 Changes Overview
+- **<F#>** — <concrete change with \`symbols\`>
+(≤6 bullets; cite by alias F1/F2/...)
+
+## 🔍 Code Review
+**Correctness:** <one sentence>
+**Tests:** <coverage / gaps>
+**Security & data integrity:** <auth, input, PII>
+**Performance / regressions:** <hot paths, N+1>
+
+**Prior reviewer feedback:** None.
+**Findings:** None.
 **Conclusion:** APPROVED ✅"
 
   if (( incremental )); then

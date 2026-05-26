@@ -67,9 +67,11 @@ classify_triage() {
     return
   fi
 
-  # Whitespace-only check on the actual code changes.
+  # Whitespace-only check on the actual code changes. INCR_PATHS (global, set by
+  # the orchestrator) narrows this to the PR's own files in incremental mode;
+  # empty otherwise, so all paths are considered.
   local ws_diff
-  ws_diff="$(git diff -w "$diff_base..$head_sha" 2>/dev/null || true)"
+  ws_diff="$(git diff -w "$diff_base..$head_sha" -- "${INCR_PATHS[@]}" 2>/dev/null || true)"
   if [[ -z "$ws_diff" ]]; then
     TRIAGE_SKIP_REASON="whitespace-only diff"
   fi
